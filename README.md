@@ -7,6 +7,16 @@
 > 控制台走芯片内置 **USB-Serial/JTAG**（就是你一直用的 COM43），tick 用 **SYSTIMER**，中断走 **CLIC**。
 > 外设走 **RT-Thread 设备框架**：`PIN` / `SPI`（含 `QSPI`）/ `I2C` 三类标准 ops，msh 里可直接验证。
 
+![ESP32-S31-Function-CoreBoard-1 正面](doc/img/board-front.png)
+
+> 板子正面（图：乐鑫官方《ESP32-S31 DevKits User Guide》Fig.2，仅作接线说明用）。
+> 本工程用到图上这几处：
+> **(5) USB Serial/JTAG** = 控制台 `COM43`（也是烧录口）；
+> **(1) J2 排针** = 外设全在它上面（SPI 屏 SCK43/MOSI44/CS45/DC46/RST47/BL48、I2C0 = 50/51、I2C1 = 2/3、外接 SPI 模块 = 43/44/45/46）；
+> **(10) ESP32-S31-WROOM-3** 模组自带 **16MB PSRAM**（下面 **§5.10** 的测速用的就是它）；
+> **(12) RGB LED** 本工程暂未驱动（想加可以照 `boot_msc_s31` 的 RMT 驱动抄）。
+> 其余接口（网口/音频/咪头）本工程没用到。
+
 ---
 
 ## 1. 快速上手
@@ -360,7 +370,7 @@ rtt_nano_s31/
 
 ---
 
-### 5.10 PSRAM（2026-09-25 新增）：16MB 8 线 DDR @200MHz，窗口 `0x50000000`
+### 5.10 PSRAM（16MB 8 线 DDR @200MHz）+ 读写速度实测
 
 移植自 `boot_msc_s31/bsp/s31_psram.c` —— 那份是在真板上把 PSRAM 调通、并且把坑全踩完的版本。
 `board init → s31_psram_init()`，起来之后 `(volatile uint32_t *)0x50000000` 就是普通内存。
@@ -386,6 +396,39 @@ rtt_nano_s31/
 | PSRAM memcpy（PSRAM→PSRAM） | **54 MB/s** | 读写抢同一条总线，只有单向的一半 |
 | 内部 RAM → PSRAM memcpy | **102 MB/s** | 内部 RAM 侧不是瓶颈 |
 | PSRAM 16KB 反复读 | **502 MB/s** | ★ 这行量的是 **L1 命中带宽**，跟前面不是一个量纲 |
+
+**原始输出**（`make msh MSH="psram_speed 256"`，真板 COM43 抓的，一字未改）：
+
+```
+PSRAM 带宽 @256 KB（每项 3 轮取最小；1 MB/s = 1 B/us）
+  内部RAM 写 u32(对照)       513 us     511.0 MB/s
+  内部RAM 读 u32(对照)       513 us     511.0 MB/s
+  PSRAM 写 u32                2469 us     106.1 MB/s
+  PSRAM 读 u32                2232 us     117.4 MB/s
+  PSRAM 写 u64                2486 us     105.4 MB/s
+  PSRAM 读 u64                2156 us     121.5 MB/s
+  PSRAM memset                2447 us     107.1 MB/s
+  PSRAM->PSRAM memcpy         4839 us      54.1 MB/s
+  内部RAM->PSRAM memcpy       2557 us     102.5 MB/s
+  PSRAM 16KB 反复读(命中L1)   2090 us     501.7 MB/s
+  提示: 顺序读受 cache 行填充限制（64B/行 ≈378ns）；
+        最后那行「16KB 反复读」量的是 **L1 命中带宽**（≈510 MB/s），
+        跟前面几行不是一个量纲 —— 差 4 倍是正常的，别当成 PSRAM 变快了
+```
+
+**怎么复现**：
+
+```powershell
+make flash                              # 烧一版（PSRAM 初始化在 board init 里）
+make msh MSH="psram_info"               # 状态/容量/快速自检
+make msh MSH="psram_test 512"           # 512KB 写 pattern 再逐字节读回
+make msh MSH="psram_speed 256"          # 就是上面那张表
+```
+
+> 📌 **怎么判断这组数字是可信的**：① 它和 IDF 工程 `s31_membench` 独立测的
+> （PSRAM 103~116 MB/s）对得上；② 跑 `make safe`（CPU 降到 40MHz）之后
+> **所有数字整体掉 8 倍**（内部 RAM 63、PSRAM 37 MB/s）—— CPU 侧一变，
+> 数字跟着变，正说明量的是真的内存访问，不是固定开销或编译器把循环优化掉了。
 
 **三个测速坑（`app/main.c` 里都写在注释上了）**
 
