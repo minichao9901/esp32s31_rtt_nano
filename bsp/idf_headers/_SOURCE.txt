@@ -1,0 +1,22 @@
+来源 IDF 源码树 : E:\esp32-idf\esp-idf
+IDF 版本        : v6.1.0
+IDF git describe: v6.1
+IDF git commit  : fff9895c8
+同步时间        : 2026-09-25 08:47:03
+文件数          : 45
+合计            : 2408.1 KB
+
+include 根（顺序即编译器的搜索顺序）：
+  E:\esp32-idf\esp-idf\components\esp_hal_mspi\esp32s31\include
+  E:\esp32-idf\esp-idf\components\hal\esp32s31\include
+  E:\esp32-idf\esp-idf\components\hal\include
+  E:\esp32-idf\esp-idf\components\hal\platform_port\include
+  E:\esp32-idf\esp-idf\components\soc\esp32s31\include
+  E:\esp32-idf\esp-idf\components\soc\esp32s31\register
+  E:\esp32-idf\esp-idf\components\soc\include
+  E:\esp32-idf\esp-idf\components\esp_common\include
+  E:\esp32-idf\esp-idf\components\esp_rom\esp32s31\include
+  E:\esp32-idf\esp-idf\components\esp_rom\esp32s31\include\esp32s31
+  E:\esp32-idf\esp-idf\components\esp_rom\include
+
+重新同步： pwsh -File tools\sync_idf_headers.ps1

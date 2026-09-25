@@ -1,0 +1,18 @@
+# RT-Thread 源码：第三方，由 tools\fetch_rtt.ps1 按固定 tag 拉取，不进库
+rt-thread/
+rt-thread.commit
+
+# 构建产物
+m0/app.elf
+m0/app.bin
+**/*.o
+**/*.d
+
+# flash 备份（含 IDF bootloader 原始内容，随时可用 make flash 重建，不需要进库）
+prebuilt/flash_head_64KB.bin
+
+# 串口抓包
+captures/
+
+# 文档渲染的中间件（PDF 成品进库，HTML 不进）
+doc/*.html
