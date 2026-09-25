@@ -306,7 +306,7 @@ rtt_nano_s31/
   | `iomux` | CLK=20 / MOSI=21 / MISO=22 / CS=23 / HD=24 / WP=25（MCU_SEL=2） | **真四线 QIO 只能用这组** |
 - 🚨 **四线必须用专用 IO_MUX 脚**：IDF 的 `check_iomux_pins_quad()` 要求四根数据线/时钟都是外设的
   IO_MUX 脚 —— GPIO matrix 下数据线在数据相位**没法三态**（oen_sel=0 时输出使能由 GPIO_ENABLE 管，
-  从机驱不动线）。那 6 个脚在板上是 SDIO 的 SD_D0~D3/CLK/CMD（J2 的 26~30，板上没卡座）。
+  从机驱不动线）。那 6 个脚在板上是 SDIO 的 SD_D0\~D3/CLK/CMD（J2 的 26\~30，板上没卡座）。
 - 🚨 **CS 走硬件 CS0 信号（62），不是普通 GPIO**：早期版本拿 GPIO 手动拉 CS，实测（`s31_reg` 回读）
   开机后 CS 焊盘的 `OUT_SEL` 是 0x47、`GPIO_ENABLE1` 对应位是 0 —— **片选根本没生效**，
   SPI 事务是在"CS 恒高"下跑的。现在开机就打印自检值：
@@ -476,7 +476,7 @@ make msh MSH="psram_speed 256"          # 就是上面那张表
 9. **I2C 扫出 63 个设备**（全 ACK）→ ① 焊盘没开漏（推挽顶死总线）；② ACK 判据用错（`RESP_REC` 极性与头文件相反）；
    ③ 背靠背扫描时 `INT_CLR` 清不掉 `TRANS_DONE` 残留 → 用"基线掩码 + SYSTIMER 计时窗口"。
 10. **SPI 分频器算错**（1MHz 请求实际跑出 4.5MHz）
-    → **S31 的 `CLKDIV_PRE` 只有 4 位（1~16）**，不是老 ESP32 的 6 位（1~64）：写 20 被硬件截成 4。
+    → **S31 的 `CLKDIV_PRE` 只有 4 位（1\~16）**，不是老 ESP32 的 6 位（1\~64）：写 20 被硬件截成 4。
     现象很有迷惑性：**1MHz 和 5MHz 两档耗时一模一样**。是环回自检量位率时露的马脚。
 11. **环回自检一直读到 0** → `spi_mux_out()` 把焊盘配成输出时会清掉 `FUN_IE`，
     同一根焊盘自己的输入通路就断了 → 环回前把 MOSI 焊盘的 IE 打开。
