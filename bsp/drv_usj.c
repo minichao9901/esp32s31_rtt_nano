@@ -36,11 +36,39 @@ static int in_isr(void)
     return (mstatus & 0x8u) == 0;
 }
 
+/* ⚠️ 这里**故意不做** USB 设备块的 `rst_en` 脉冲（CNNT_SYS+0x34 bit31），
+ *    哪怕 IDF 的 `usb_serial_jtag_ll_reset_register()` 是那么干的。
+ *    原因（2026-09-25 实测，代价是一次整板断电）：本函数跑在 `rt_hw_board_init()`
+ *    的**最开头**，那时 `s31_clk_init()` 还没执行、48M/CPLL 时钟树没起来 ——
+ *    在这个时刻复位 USB 设备块，它**回不来**：CDC 和 JTAG 一起失联，
+ *    串口报 "设备没有发挥作用"、OpenOCD 报 `Unsupported DTM version: -1`，
+ *    只能物理断电。要做这个复位，必须挪到时钟树就绪之后再试。*/
 void s31_usj_hw_init(void)
 {
-    /* 外设时钟/PHY 由 bootROM 配好（M0 实测 ROM 的 printf 就是从这个 FIFO 出去的），
-     * 这里只把 PHY 焊盘使能再确认一遍（幂等）。 */
+    /* PHY 焊盘使能（外设时钟/PHY 由 bootROM 配好，这行幂等）*/
     S31_REG32(S31_USJ_CONF0) |= S31_USJ_CONF0_PAD_ENABLE;
+
+    /* ① 关中断 + 清掉所有中断标志（含 BUS_RESET，见文件开头的说明）*/
+    S31_REG32(S31_USJ_INT_ENA) = 0u;
+    S31_REG32(S31_USJ_INT_CLR) = 0xFFFFFFFFu;
+
+    /* ② 冲一次 TX FIFO（wr_done 语义见本文件上方那段说明）*/
+    S31_REG32(S31_USJ_EP1_CONF) = S31_USJ_EP1_WR_DONE;
+    {
+        rt_uint32_t guard = 0;
+        while (!(S31_REG32(S31_USJ_EP1_CONF) & S31_USJ_IN_EP_DATA_FREE) &&
+               guard++ < 100000u) {
+        }
+    }
+
+    /* ③ 把 RX FIFO 里残留的字节读掉（不清会被当成下一条命令重放）*/
+    {
+        rt_uint32_t n = 0;
+        while ((S31_REG32(S31_USJ_EP1_CONF) & S31_USJ_OUT_EP_DATA_AVAIL) && n++ < 256u) {
+            (void)S31_REG32(S31_USJ_EP1);
+        }
+    }
+    S31_REG32(S31_USJ_INT_CLR) = 0xFFFFFFFFu;
 }
 
 /* ---- 环形缓冲的生产者侧 ------------------------------------------------- */

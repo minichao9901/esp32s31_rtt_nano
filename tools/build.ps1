@@ -20,6 +20,7 @@ param(
     [switch]$SkipFlash,
     [switch]$Rebuild,
     [switch]$Safe,
+    [switch]$NoStub,          # 退回老的 --no-stub 烧录方式（默认不带，见下面烧录段的说明）
     [string]$Port = '',
     [string]$Msh = '',
     [int]$ReadSeconds = 4
@@ -134,7 +135,12 @@ $otherSrc += @('startup.S', 'trap_gcc.S', 'board.c', 'drv_usj.c', 'drv_usj_dev.c
 $otherSrc += @('drv_gpio.c', 'drv_spi.c', 'drv_i2c.c', 'drv_lcd_axs15352.c') |
              ForEach-Object { Join-Path $Bsp $_ } |
              Where-Object { Test-Path $_ }
-# PSRAM：初始化 + 速度测试（从 boot_msc_s31 移植；"写好一个就自动参与编译"同上）
+# SFUD（bsp/sfud/：inc + src 是**原样 vendor 的上游**，port 是本工程写的胶水）
+#   新增文件放这两个目录里就自动参与编译（同上面"写好一个就自动参与"的规矩）。
+#   ⚠️ 别把 rt-thread\components\drivers\spi\dev_spi_flash_sfud.c 加进来：
+#      那个官方移植层会抢 `sfud_spi_port_init` 和 `sf` 命令（和本 port 重复）。
+$otherSrc += Get-ChildItem (Join-Path $Bsp 'sfud\src'), (Join-Path $Bsp 'sfud\port') -Filter *.c |
+             Select-Object -ExpandProperty FullName
 $otherSrc += @('s31_psram.c') |
              ForEach-Object { Join-Path $Bsp $_ } |
              Where-Object { Test-Path $_ }
@@ -142,6 +148,9 @@ $otherSrc += (Join-Path $App 'main.c')
 
 $inc = @(
     "-I$Bsp",
+    # SFUD：sfud_def.h 里是 `#include <sfud_cfg.h>`（尖括号），所以 inc 目录必须进搜索路径
+    "-I$Bsp\sfud\inc",
+    "-I$Bsp\sfud\port",
     # ★ 冻结的 IDF 头（bsp/s31_psram.c 里的 LL 头靠它编过）——
     #   放最后，工程自己的同名头优先
     "-I$Bsp\idf_headers",
@@ -178,7 +187,11 @@ $failed = $false
 # 症状是"明明改了 rtconfig.h 却报某某符号未定义"—— 踩过）
 $GlobalHeaders = @(
     (Join-Path $Bsp 'rtconfig.h'),
-    (Join-Path $Bsp 's31_regs.h')
+    (Join-Path $Bsp 's31_regs.h'),
+    # SFUD 的配置头：改了它（开关功能/换设备表）必须全量重编，
+    # 否则会拿旧配置的 .o 去链，症状是"明明打开了某个功能却没生效"（踩过）
+    (Join-Path $Bsp 'sfud\inc\sfud_cfg.h'),
+    (Join-Path $Bsp 'sfud\port\sfud_port.h')
 )
 $NewestHeader = ($GlobalHeaders | Where-Object { Test-Path $_ } |
                  ForEach-Object { (Get-Item $_).LastWriteTime } |
@@ -238,9 +251,20 @@ finally {
 if ($BuildOnly -or $SkipFlash) { Write-Host 'done (no flash)'; exit 0 }
 
 # ---- 烧录到 0x2000（bootROM 的二级镜像偏移）-------------------------------
+# 🚨 **别再默认加 `--no-stub`**（2026-09-25 改）：本工程原来硬编码 `--no-stub`，
+#    而 IDF 的 `idf.py flash` 默认是**带 stub** 的（`serial_ext.py:84` 只在用户
+#    显式要求时才加 `--no-stub`）。差别很要命：
+#      · 带 stub：esptool 先往芯片 RAM 传一个 flasher stub，烧完由 stub 做干净收尾；
+#      · 不带 stub：直接用 ROM 的原语烧 —— **收尾时 USB-Serial/JTAG 会被留在
+#        "上一次会话"的状态里**，现象就是"烧完控制台哑了"（串口 0 字节，
+#        而 JTAG 采 PC 显示 app 一直在正常跑 idle/spinlock）。
+#    另一个结构性差别：IDF 有二级 bootloader，它启动时会把 console（含 USB-Serial/JTAG）
+#    重新初始化一遍；本工程没有 bootloader，ROM 直接跳进 app，没人替我们清那个残留。
+#    真要退回老路子：`make flash NOSTUB=1`。
 Push-Location $Build
 try {
-    & $PyExe -m esptool --chip esp32s31 -p $Port -b 460800 --no-stub `
+    $stubArg = if ($NoStub) { @('--no-stub') } else { @() }
+    & $PyExe -m esptool --chip esp32s31 -p $Port -b 460800 @stubArg `
         --before default-reset --after hard-reset `
         write-flash -fm dio -ff 80m -fs 16MB 0x2000 app.bin
     if ($LASTEXITCODE -ne 0) { Write-Host 'FLASH FAILED' -ForegroundColor Red; exit 1 }

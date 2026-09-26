@@ -32,7 +32,7 @@ MK   := $(PWSH) tools/make.ps1
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build rebuild clean size flash run monitor msh watch tail reset safe headers fetch doc
+.PHONY: help build rebuild clean size flash flash-nostub flash-ocd run monitor msh watch tail reset safe headers fetch doc
 
 help:
 	@$(MK) help
@@ -51,6 +51,14 @@ size:
 
 flash:
 	@$(MK) flash -Port "$(PORT)" -Seconds $(SECONDS)
+
+# flash-nostub：退回老的烧录方式（esptool --no-stub）—— 只在"带 stub 烧不进去"时才用
+flash-nostub:
+	@$(MK) flash -Port "$(PORT)" -Seconds $(SECONDS) -NoStub
+
+# flash-ocd：走 JTAG 烧（**不碰 USB CDC**）—— esptool 烧完控制台哑时用这条
+flash-ocd:
+	@$(MK) flash-ocd -Port "$(PORT)" -Seconds $(SECONDS)
 
 # flash + 一直看串口（SECONDS=8 就只看 8 秒）
 run:

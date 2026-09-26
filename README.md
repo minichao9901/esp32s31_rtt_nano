@@ -106,6 +106,17 @@ pwsh -File tools\reset_probe.py COM43 5          # 板子不理人时手动拉 E
 | `psram_speed [KB]` | **PSRAM 读写带宽**（内部 RAM 做对照；见 §5.10 的数字与三个测速坑）|
 | `reboot` | 整片复位（走 RTC 看门狗；见 §5.9 的说明 —— **别用 core0 软复位**） |
 | `lcd [demo\|fill <色>\|clk <hz>]` | 外接 SPI 屏（AXS15352 240×296）：`lcd demo` = 8 色 × 2 轮刷屏，`lcd fill r\|g\|b\|black\|white\|rg\|gb\|rb` 单色，`lcd clk 10000000` 降时钟（花屏时用） |
+| `sf probe [dev] [hz]` | **SFUD 识别外接 SPI flash**（默认 `flash0` / 20 MHz；见 §5.11） |
+| `sf info` | 型号/容量/写粒度/擦除粒度 + **SFDP 解析结果** + 状态寄存器逐位解释 |
+| `sf dbg [hz]` | **裸事务诊断**：0x9F/0x90/0x5A/0x05/0x03 的原始字节 + SPI2 寄存器快照 |
+| `sf bb` | **软件位翻转读 0x9F（绕开 SPI 外设）** 连读 5 次 —— 判"模块/接线"还是"驱动" |
+| `sf clk [hz]` | 看/换 SPI 时钟（换完自动重识别，通不过会退回默认档） |
+| `sf read <addr> [len]` | 读 + 十六进制 dump（默认 64 B，单次最多 4 KB） |
+| `sf write <addr> <hex>` | **先擦后写**；hex 写 `"DEADBEEF"`（一条最多 32 B）或空格分开的 `AA BB CC` |
+| `sf erase <addr> <len>` | 擦除（按 4 KB 扇区向上对齐，打印实际覆盖范围） |
+| `sf status [vol] [val]` | 读状态寄存器（WIP/WEL/BP/SRP 逐位解释）/ 写 |
+| `sf test <addr> [len]` | **完整自检**：备份→擦→验全 FF→写花样（含跨页）→逐字节读回校验→还原 |
+| `sf bench <addr> <len>` | 速度基准：擦/写/读 + **4 档块长对照**（判断要不要上 DMA 用） |
 
 ---
 
@@ -307,16 +318,51 @@ rtt_nano_s31/
 - 🚨 **四线必须用专用 IO_MUX 脚**：IDF 的 `check_iomux_pins_quad()` 要求四根数据线/时钟都是外设的
   IO_MUX 脚 —— GPIO matrix 下数据线在数据相位**没法三态**（oen_sel=0 时输出使能由 GPIO_ENABLE 管，
   从机驱不动线）。那 6 个脚在板上是 SDIO 的 SD_D0\~D3/CLK/CMD（J2 的 26\~30，板上没卡座）。
-- 🚨 **CS 走硬件 CS0 信号（62），不是普通 GPIO**：早期版本拿 GPIO 手动拉 CS，实测（`s31_reg` 回读）
-  开机后 CS 焊盘的 `OUT_SEL` 是 0x47、`GPIO_ENABLE1` 对应位是 0 —— **片选根本没生效**，
-  SPI 事务是在"CS 恒高"下跑的。现在开机就打印自检值：
-  ```
-  [spi] 自检 CS: GPIO46 OUT_SEL=62(应=62)  SCK=53 MOSI=55  MISO_IN54=557
-  ```
-- 跨消息保持片选靠 `SPI_MISC.cs_keep_active`（`send_then_recv` 的两条消息之间不能抬 CS）。
+- 🚨🚨 **CS 必须是"软件驱动的普通 GPIO"，不能用外设 CS0 信号**（2026-09-25 定论，为此白跑了一整轮）。
+  - **现象**：外接 flash 只有**每次外设复位后的第一条事务能通**，之后永远读回全 0；
+    `spi_id` 连跑两次就是"第一次 `EF 40 17`、第二次 `00 00 00`"。
+  - **根因**：外设 CS0 信号只在一次 `USR` 期间有效，**两次事务之间那个焊盘没有把线抬起来**
+    （既没被驱动、模块上也没有上拉）→ flash 看不到"CS 抬起"这个命令边界
+    → 它把第二条 `0x9F` 当成上一条命令的续传数据吞掉 → 读回全 0。
+    外设软复位能再通一次，正是因为复位瞬间焊盘松开、线被抬起来重新同步了。
+  - **怎么定位的**（三条证据，值得复用）：
+    1. `sf bb`（**软件位翻转**读 0x9F，完全绕开 SPI 外设、自己拉 CS）连读 5 次**全对**
+       ⇒ flash/接线/供电都好，问题是驱动的；
+    2. `spi_loop` 连跑 3 次全过 ⇒ 时钟/FIFO/收发通路也好（**注意环回测不到 CS**：
+       它把 MISO 内部接到自己的 MOSI，不需要片选也能过）；
+    3. 好读/坏读前后的 SPI2 寄存器快照**完全一致** ⇒ 没有配置寄存器被改坏；
+       而 `gpio_in1` 的 CS 位（GPIO46 → bit14）空闲时是 **0**、`GPIO_ENABLE1` 是 **0**。
+  - **修法**：CS 焊盘 `OUT_SEL=256`（取 GPIO_OUT 寄存器）+ **打开输出使能**
+    （`GPIO_ENABLE1_W1TS`，少了这句焊盘就是高阻 —— 这也是早期"手动 GPIO 拉 CS 没生效"的真因），
+    然后 `spi_cs_assert()` 拉低 / `spi_cs_release()` 拉高。空闲永远是确定的高电平。
+    开机自检会打出来：
+    ```
+    [spi] 自检 CS: GPIO46 OUT_SEL=256(应=256) OE=1(应=1)  SCK=53 MOSI=55  MISO_IN54=557
+    ```
+  - ⚠️ 顺带澄清：`SPI_CK_IDLE_EDGE=BIT(29)` / `SPI_CS_KEEP_ACTIVE=BIT(30)` 这两个常量
+    **是对的**（IDF `soc/esp32s31/register/soc/spi_reg.h` 确认）。别拿
+    `spi_mem_c_reg.h`（那是 **MSPI/flash 控制器**那张图，MISC 在 0x34、USR 在 bit18）去对，会对错位。
+- 跨消息保持片选：现在由软件决定（`cs_take` 拉低、`cs_release` 拉高），
+  不再依赖 `SPI_MISC.cs_keep_active`。
 - **两条 RT-Thread 总线**（同一个 `struct rt_spi_bus` 不能注册两次）：
   `spi2`（`rt_spi_ops`）+ `qspi2`（`rt_qspi_bus_register`），设备 `flash0` / `qflash0`。
-- ⚠️ **PIO 一次最多 64 字节**（16 字 FIFO）；要更长得上 DMA。
+- ⚠️ **PIO 一次最多 64 字节**（16 字 FIFO）；**超过 64 字节自动走 DMA**（见下）。
+- 🚀 **DMA 通路（2026-09-25 加，AXI PDMA）**：让一次事务能搬任意长度。
+
+  | 事实 | 值 | 出处（IDF esp32s31 头，都核对过） |
+  |---|---|---|
+  | SPI2 挂哪条 DMA | **AXI PDMA**，触发号 **1** | `gdma_channel.h` 的 `SOC_GDMA_TRIG_PERIPH_SPI2{,_BUS}` |
+  | AXI DMA 基址 | **0x20348000** | `soc/reg_base.h` |
+  | 通道布局 | IN 从 +0x000、OUT 从 +0x138，**步长 0x68**；CONF0+0x10、LINK1+0x20（start：IN 是 bit2、OUT 是 bit1）、LINK2+0x24（描述符地址）、PERI_SEL+0x44（[5:0]=1）、INT_RAW+0x00（bit1=suc_eof）、INT_CLR+0x0C | `axi_dma_reg.h` / `axi_dma_struct.h` |
+  | 描述符 | **16 字节、8 字节对齐**；`dw0[11:0]=size/[23:12]=length/[30]=suc_eof/[31]=owner`，size=length=字节数 | `dma_types.h` + `spi_common_internal.h`（AXI 分支选 align8）+ `spi_master.c` 的填法 |
+  | 合法地址段 | 内部 0x2F000000~0x2F07FFFF、外部 0x40000000~0x53FFFFFF | `axi_dma_ll_set_default_memory_range()` |
+  | 时钟/复位 | `HP_SYS_CLKRST.axi_pdma_ctrl0`(+0x78)：bit0 clk_en（默认 1）、bit1 rst_en（脉冲）；`AXI_DMA.misc_conf`(+0x2A8) bit4 | `gdma_ll.h` |
+
+  - **顺序**：先把 DMA 通道武装好 → 再起 SPI 的 `USR`（反了前几个字节没人接）；完成判据用 **SPI 的 `TRANS_DONE`(bit12)**（IDF 主机侧只等它），DMA 的 `suc_eof` 只当二次确认。
+  - **上限**：一次事务 **32767 字节**（`SPI_MS_DATA_BITLEN` 18 位）；描述符链最多 16×4092。
+  - 🚨 **FIFO 复位位别混**：bit29 = `rx_afifo_rst`（收）、bit30 = CPU/PIO 发 FIFO、**bit31 = DMA 发 FIFO**。PIO 用 29+30、DMA 用 29+31。清中断要写 **`DMA_INT_CLR`(0x38)**，写 `RAW` 是清不掉的。
+  - 🚨 **cache 的结论**：S31 的 cache **只覆盖 0x40000000 起的外部窗口**（PSRAM 在里面），内部 RAM（0x2F000000~0x2F080000）**不经 cache** —— `SOC_CACHE_INTERNAL_MEM_VIA_L1CACHE` 在 esp32s31 未定义，`esp_cache_msync()` 对它返回 `NOT_SUPPORTED`。所以**内部 RAM 缓冲无需任何 cache 维护**（已用 4096 字节读回校验实测）。PSRAM 缓冲则一律挡回去走分块 PIO —— 不跟"写回/失效 + 64 字节行对齐"较劲，慢但绝不会错。
+  - **实测**：读 8192 B **4189 µs = 1.95 MB/s**（= 20 MHz 线速 78%）；事务尺寸对照 16 B→1.10、64 B→1.68（PIO 天花板）、256 B→1.88、4096 B→1.95 MB/s（拐点就在 64/256 之间）。参考工程用 IDF 的 DMA 读 4 KB 是 2468 kB/s（98.7%）—— **剩的 22% 是 DMA/FIFO 握手开销**：实测"每字节固定多约 115 ns，且与时钟无关"（5 MHz 时效率 93%、20 MHz 时 78%），不是配置错。
 - 🚨 **RT-Thread 的 QSPI 配置有两份**：`rt_qspi_device.config.parent`（`rt_qspi_configure` 写的）
   和 `rt_spi_device.parent.config`（驱动 `configure()` 实际读到的那份），两者**不会自动同步** ——
   不同步时 QSPI 的时钟/线宽设置等于没设（现象：qspi 帧快慢跟着上一次普通 SPI 的配置走）。
@@ -454,6 +500,71 @@ make msh MSH="psram_speed 256"          # 就是上面那张表
 
 ---
 
+### 5.11 SFUD：外接 SPI flash（`bsp/sfud/`，2026-09-25）
+
+把 [armink/SFUD](https://github.com/armink/SFUD)（MIT）接到 `drv_spi.c` 的 `spi2` 总线上。
+上游源码就在 `rt-thread/components/drivers/spi/sfud/`，**原样 vendor** 到 `bsp/sfud/`（5 个文件，
+SHA256 与上游一致），本工程只写配置头 + 移植层 + 命令层：
+
+| 位置 | 内容 | 动没动上游 |
+|---|---|---|
+| `bsp/sfud/inc/` + `src/` | SFUD 引擎（`sfud.c` / `sfud_sfdp.c` + 4 个头） | **一个字没改**（校验哈希可证） |
+| `bsp/sfud/inc/sfud_cfg.h` | **本工程写的**配置：开 SFDP + 型号表、日志接 `rt_kprintf`、静态设备表 1 个 | 替换上游那份（上游绑 Kconfig/rtdbg） |
+| `bsp/sfud/port/sfud_port.c` | 移植层：`wr/lock/unlock` 钩子 + `sfud_spi_port_init()` + `s31_sfud_probe()` | 新写 |
+| `bsp/sfud/port/sfud_cmd.c` | `sf` 系列 msh 命令 | 新写 |
+
+- **接的是 `flash0`**（`drv_spi.c` 挂在 `spi2` 上的设备），默认 20 MHz、mode0、8 位。
+  接线就是那套：**SCK=43(J2-17) MOSI=44(J2-18) MISO=45(J2-15) CS=46(J2-16)** + 3V3/GND。
+- 实测芯片：**Winbond W25Q64CV，8 MB，4 KB 扇区（擦除命令 0x20），SFDP rev 1.5**。
+  换别的 SPI NOR（GD25Qxx / MX25xx…）不用改代码 —— 先 SFDP 自动解析，解析不了再查内置型号表。
+- 🚨 **移植层的 `wr()` 必须自己切块**：`drv_spi.c` 是 PIO 通路，**一次最多 64 字节**，
+  超了驱动返回 0（不报错、不崩，就是"这次传输什么都没发生"）。命令+地址（≤8 B）与数据
+  （≤64 B）分开发，中间靠软件 CS 一直压着 —— 对 flash 来说仍是一次连续片选。
+- ⚠️ **`sfud_spi_port_init()` 这个名字改不了**（`sfud.c:252` 写死成 extern 调用），
+  所以**绝不能**把 RT-Thread 官方的 `components/drivers/spi/dev_spi_flash_sfud.c` 加进编译：
+  那份也定义同名函数、还有同名的 `sf` 命令，会直接撞车。`build.ps1` 只 glob `bsp\sfud\{src,port}`。
+- ⚠️ **设备本体用 SFUD 自己那张静态表**（`sfud_get_device(0)` 拿到的那份）。
+  第一版自己又定义了一份 `sfud_flash` 去初始化，结果"probe 成功、`get_device(0)->init_ok` 永远是 0"
+  —— 初始化的和取回的是两个对象。
+- `build.ps1` 里把 `sfud_cfg.h` / `sfud_port.h` 加进了**全局头依赖表**（改了会全量重编），
+  `bsp/sfud/{src,port}/*.c` 自动参与编译（跟 bsp 下别的驱动一个规矩）。
+- ⚠️ **`sf` 命令的地址参数一律必填**：没有"不带参数就整片擦"的路径 —— 上游那个 `sf bench`
+  是整片擦，这块板子的外接 flash 未必是空的，不能默认抹掉。`sf test` / `sf bench` 也只动你给的那段。
+- 📊 **实测（W25Q64CV @20 MHz，PIO 一次 64 字节）**：
+
+  | 项目 | 实测 | 说明 |
+  |---|---|---|
+  | 擦 4 KB | **39\~47 ms** | W25Q64 的 tSE 典型值就是 45 ms（不是慢，是这芯片就这样）|
+  | 写（按 256 B 页） | **0.4 MB/s** | 大头是每页 0.7 ms 的 tPP，不是总线 |
+  | 读 | **1.6 MB/s** | 20 MHz 线速的 **64%**；参考工程用 IDF 的 **DMA** 单事务读 4 KB 是 2468 kB/s（98.7%）⇒ **差距全在 PIO 每 64 字节重配一次** |
+  | `sf test` 自检 | **PASS**（4096/4096 字节一致 + 还原成功）| 擦→验全 FF→写花样（含跨页）→逐字节读回→还原原数据 |
+
+  `sf bench` 的"SPI 事务尺寸对照"是把移植层的切块大小从 64 往下调着量（**真的在改事务尺寸**）：
+  8 B → 0.7、16 B → 1.1、32 B → 1.4、64 B → 1.6 MB/s。往上就到头了（PIO 只有 16 字 FIFO）。
+- 🚨 **移植层自己踩的三个坑**（都不在 SFUD 里）：
+  1. **切块读必须每块递增地址** —— 一开始只是把同一段"0x03 + 地址 0"重复发 N 次，
+     现象是"第一块对、从 +64 起全不对，读回的值正好是缓冲区开头的内容"。
+     ⚠️ 但只有**普通读 0x03** 能这么算地址：`0x9F` 没有地址、`0x5A`(SFDP) 和 `0x0B` 最后还有个空转字节，
+     好在它们一次最多读 36 字节、一块就够。
+  2. **页编程是一条 4 + 256 字节的长写**（`sfud.c:664` 一次给 260 字节），
+     必须拆成"命令+地址"+"分块数据"的 **message 链**（`cs_take` 只在第一段、`cs_release` 只在最后一段）；
+     用 `rt_spi_transfer()` 会把 `cs_take/cs_release` 都置 1，等于第一段发完就抬 CS。
+     ⚠️ 链的越界检查要写在**用之前**，写在 `n++` 之后的话最后一块正好顶到上限、被误判成"链太长"。
+  3. **`-RT_EBUSY` 不是错误**：`rt_spi_bus_configure()` 在"总线被别的设备占着"时就返回它
+     （源码注释原文：*not an error condition and the configuration will take effect once the
+     device has the bus*），把它当失败会让 probe 在跑过别的 SPI 设备之后直接报 rc=-7。
+  4. 调试开关要用 `#if` 而不是 `#ifdef` —— 宏定义成 `0` 也算"已定义"，`#ifdef` 关不掉（日志里一直冒 `[sfud-x]`）。
+
+> 🚨 **这一节最值钱的不是 SFUD，是它逼出来的那个 SPI 片选 bug** —— 见 §5.6 里那条
+> "CS 必须是软件驱动的普通 GPIO"。当时的现象是"**只有第一条事务能通**"，
+> 把 SFUD、RT-Thread 的 SPI 框架、事务写法全怀疑了一遍，最后靠三条证据定位：
+> `sf bb`（软件位翻转 5/5 全对）证明硬件没问题、`spi_loop` 连跑 3 次证明通路没问题、
+> 寄存器对账证明配置没被改坏 ⇒ 剩下的只有"CS 在事务之间没有高电平"。
+> **`sf bb` 这条命令留着**：以后任何"某条 SPI 器件读不出来"的场合，它都能一刀切开
+> "模块/接线"和"驱动"两边。
+
+---
+
 ## 6. 踩过的坑（现象 → 根因 → 修法）
 
 1. **`INIT_*_EXPORT` 的函数一个都不执行**（tick 不开、msh 不起，但版本号和 main 都正常）
@@ -537,6 +648,74 @@ make msh MSH="psram_speed 256"          # 就是上面那张表
       → 上锁。我们的 `startup.S` 现在也这么干（就在关 RTC_WDT/MWDT 那几行之后）。
     - 为什么它会响：我们在 startup 里**把 RTC_WDT 关了**（`CONFIG0=0`），而 SWD 盯的就是 RTC_WDT 的
       喂狗信号 → 没人喂 → 定期复位。**"关掉看门狗"和"让看门狗满意"是两件事。**
+23. 🚨🚨 **SPI 片选（CS）在两次事务之间没有高电平 ⇒ 从机丢掉"命令边界"**
+    （2026-09-25，为了移植 SFUD 挖了一整轮，详见 §5.6 / §5.11）：
+    - **现象**：外接 flash **只有外设复位后的第一条事务能通**，之后永远读回全 0；
+      `spi_id` 连跑两次就是"第一次 `EF 40 17`、第二次 `00 00 00`"。
+    - **根因**：CS 焊盘接的是外设 CS0 信号，而它**只在一次 `USR` 期间有效** ——
+      事务与事务之间那根线既没被驱动、模块上也没有上拉，等于浮空；
+      flash 看不到"CS 抬起"这个命令边界，就把第二条 `0x9F` 当成上一条的续传数据吞掉。
+      外设软复位能再通一次，是因为复位瞬间焊盘松开、线被抬起来重新同步了。
+    - **修法**：CS 改成**软件驱动的普通 GPIO** —— `OUT_SEL=256`（取 GPIO_OUT 寄存器）
+      **＋ 打开输出使能 `GPIO_ENABLE1_W1TS`**（少了这句焊盘就是高阻，这正是早期
+      "手动 GPIO 拉 CS 没生效"的真因），然后 assert 拉低 / release 拉高。
+    - **怎么定性的**（三条证据，方法论比结论值钱）：`sf bb` 用软件位翻转**绕开整个 SPI 外设**
+      读 0x9F，连读 5 次全对 ⇒ 模块/接线/供电没问题；`spi_loop` 连跑 3 次全过 ⇒
+      时钟/FIFO/收发通路没问题（⚠️ **环回测不到 CS**，它把 MISO 内部接到自己的 MOSI，
+      不需要片选也能过 —— 这一点最容易被骗）；好读/坏读前后的 SPI2 寄存器快照完全一致 ⇒
+      没有配置寄存器被改坏。三条一排除，剩下的只有 CS。
+    - ⚠️ 顺带纠正一个**差点自己骗自己**的弯路：`SPI_CK_IDLE_EDGE=BIT(29)` /
+      `SPI_CS_KEEP_ACTIVE=BIT(30)` 是对的（以 `soc/esp32s31/register/soc/spi_reg.h` 为准）。
+      **别拿 `spi_mem_c_reg.h` 去对** —— 那是 MSPI/flash 控制器那张图（MISC 在 0x34、USR 在 bit18），
+      对出来的"位号错了 20 位"是假警报。
+24. 🔧 **USB-JTAG 卡死（串口 0 字节 + esptool `No serial data received`）时的两条自救路**
+    （2026-09-25 实测补充，接在第 16 条后面）：
+    - ① **OpenOCD 直接烧 flash**（完全绕开 CDC）：
+      ```powershell
+      & $ocd -s $s -f "$s\board\esp32s31-builtin.cfg" `
+             -c "init" -c "reset halt" -c "program build\app.bin 0x2000 verify" -c "reset run" -c "shutdown"
+      ```
+      ⚠️ **它自己的 `verify` 会段错误**（exit `0xC0000005`，日志停在 `** Verify Started **`）——
+      但**写入是成功的**。要校验就自己回读比对：
+      `-c "flash read_bank 0 <绝对路径> 0x2000 90112"` 再跟 `app.bin` 逐字节比（实测 0 字节不符）。
+      `program` 会警告 `Unknown magic number in partition table`（我们不用 IDF 分区表，可忽略）。
+    - ② 判断"是 USB 块坏了还是固件发送路径坏了"：**看 esptool 能不能握手**。
+      连 esptool 都握不上 ⇒ USB 设备块整块卡死，固件侧无解，**只能拔插 USB-DBG 线物理断电**
+      （CPU 级 `reset run` / DTR-RTS 都不够，因为复位不到 USB 块）。
+    - ③ 别急着怪固件：JTAG `halt; reg pc` 连采几次，PC 落在 `rt_thread_defunct_dequeue` /
+      `rt_spin_lock_irqsave` 这种不同位置 ⇒ **CPU 在正常跑**，只是输出出不去。
+25. 🚨🚨 **"烧完/切时钟后控制台哑掉"的真正机制与修法**（2026-09-25 定论，纠缠了好几轮）：
+    - **现象**：串口输出停在开机某一行（**每次都停在 `[clk] 1` 附近**），之后全哑；
+      而 JTAG 采 PC 看到 app 一直在正常跑（idle/spinlock）。
+    - **判据（用 JTAG 直读 app 自己的变量 + 外设寄存器，一眼看出堵在哪）**：
+      `s_tx_tail=0 / s_tx_head=1814`（发送环里堵着整段日志、**一次都没被消费**），
+      而 USJ `EP1_CONF` = **0** ⇒ **bit1 `IN_EP_DATA_FREE`=0，TX FIFO 满且永不排空**
+      ⇒ 主机侧不再取数据。**不是我们的发送逻辑坏了，是 USB 设备块不干活了。**
+    - **根因**：断点在 `[clk] 1 → 2`（**CPLL 上电**）之间 ⇒ **切时钟把 USB 设备块的
+      48M 时钟带掉了**（本芯片时钟树互相影响有前科：PSRAM / EMAC 的 RGMII 参考时钟都抢 MPLL）。
+    - **修法**（`board.c` 里 `s31_clk_init()` **之后**立刻做，两行）：
+      ```c
+      S31_REG32(S31_CNNT_USB_DEVICE_CTRL) |= S31_CNNT_USB_48M_CLK_EN;  /* 只置位！*/
+      S31_REG32(S31_USJ_CONF0) |= S31_USJ_CONF0_PAD_ENABLE;
+      ```
+      ⚠️ **只能 `|=`**：`CNNT_SYS+0x34` 的 bit30 是 `usb_device_48m_clk_en`（复位默认 1）、
+      bit31 是 `usb_device_rst_en`。整字写 0 会把这颗时钟清掉 → **CDC 和 JTAG 一起失联、
+      只能物理断电**（第 17 条）；我 2026-09-25 手贱去脉冲 bit31 **也把板子搞死过一次**
+      —— 而且那次固件是**每次开机都打死 USB**，连烧都烧不进去，只能
+      **按住 BOOT 键 + 拔插 USB** 进 ROM 下载模式才救回来。
+      教训：**复位脉冲要等时钟树就绪**（`s31_usj_hw_init()` 跑在 `s31_clk_init()` 之前，那儿不能做）。
+    - **另一半：`--no-stub`**。`build.ps1` 原来硬编码 `--no-stub`，而 IDF 的 `idf.py flash`
+      **默认带 flasher stub**（`serial_ext.py:84` 只在用户要求时才加 `--no-stub`）。
+      不带 stub 时 esptool 用 ROM 原语烧、**收尾会把 USB-Serial/JTAG 留在"上一次会话"状态**。
+      现在默认带 stub（顺带快 3.7 倍：**1089 kbit/s** vs 294，压缩传输）。
+      要退回老路子：`make flash-nostub`。
+    - ✅ **验收**：连烧 **3 次**（每次烧完都读串口）**3/3 都活着**。
+    - 🔧 **排查工具**：`make flash-ocd`（走 JTAG 烧、不碰 CDC，自带 `flash read_bank`
+      回读逐字节校验 —— 因为 OpenOCD 自带的 `verify` 在 S31 上会段错误）。
+    - ⚠️ **"串口 0 字节"有两种完全不同的原因，先看 ROM 横幅分辨**：
+      ① 芯片压根没启动到 app（`boot:0x6f (DOWNLOAD)` + `waiting for download`，
+      是主机侧 DTR/RTS 把它按进下载模式了，**会粘住**，只能物理断电）；
+      ② app 在跑但控制台哑（本条）。JTAG 读 PC 是分辨两者最快的手段：0x2F80xxxx = ROM、0x2F0xxxxx = app。
 
 ---
 

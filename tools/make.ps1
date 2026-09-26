@@ -71,7 +71,8 @@ switch ($Cmd) {
         Write-Host '  make rebuild      全量重编（改了 rtconfig.h / 加了源文件后用）'
         Write-Host '  make clean        删掉 build\'
         Write-Host '  make size         看各段大小 + CLIC 入口对齐检查'
-        Write-Host '  make flash        编译 + 烧到 flash 0x2000 + 读 4 秒日志'
+        Write-Host '  make flash        编译 + 烧到 flash 0x2000 + 读 4 秒日志（走 esptool）'
+        Write-Host '  make flash-ocd    同上但**走 JTAG**（不碰 USB CDC；esptool 烧完控制台会哑时用这条）'
         Write-Host '  make run          flash 之后一直看串口（Ctrl+C 退出；SECONDS=8 只看 8 秒）'
         Write-Host '  make monitor      只看串口（SECONDS=8 看一段；缺省一直看）'
         Write-Host '  make msh          敲 msh 命令并收响应：make msh MSH="help|psram_info|free"'
@@ -108,6 +109,18 @@ switch ($Cmd) {
         if ($Rebuild) { $a += '-Rebuild' }
         if ($Safe)    { $a += '-Safe' }
         Run-Pwsh 'build.ps1' $a
+    }
+
+    # 走 JTAG 烧录（**不碰 USB CDC**）—— esptool 烧完控制台会哑时用这条
+    'flash-ocd' {
+        $a = @('-BuildOnly')
+        if ($Rebuild) { $a += '-Rebuild' }
+        if ($Safe)    { $a += '-Safe' }
+        Run-Pwsh 'build.ps1' $a
+        & pwsh @PS (Join-Path $Tools 'ocd_flash.ps1') @()
+        $script:Rc = $LASTEXITCODE
+        $rs = if ($Seconds -gt 0) { $Seconds } else { 4 }
+        Run-Py 'read_port.py' @($Port, "$rs")
     }
 
     'run' {

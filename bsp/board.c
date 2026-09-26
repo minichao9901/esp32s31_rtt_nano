@@ -134,6 +134,24 @@ void rt_hw_board_init(void)
      *    放在这里是为了让后面的开机横幅/tick 都在最终频率下跑。 */
     s31_clk_init();
 
+    /* 3b. 🚨 切完时钟**立刻把 USB 设备块的时钟/焊盘重新确认一遍**。
+     *
+     * 为什么（2026-09-25 用 JTAG 直读寄存器定位到的"板子哑了"）：
+     *   症状是控制台输出停在开机某一行、之后全哑；JTAG 读 app 自己的变量看到
+     *   `s_tx_tail=0 / s_tx_head=1814`（发送环里堵着整段日志、一步没消费），
+     *   而 USJ 的 `EP1_CONF` = **0** ⇒ **bit1 `IN_EP_DATA_FREE`=0，TX FIFO 满且永不排空**
+     *   ⇒ 主机侧不再取数据。断点在 `[clk] 1 → 2`（CPLL 上电）之间，
+     *   即**切时钟把 USB 设备块的 48M 时钟带掉了**（本芯片时钟树互相影响有前科：
+     *   PSRAM 和 EMAC 的 RGMII 参考时钟都抢 MPLL）。
+     *
+     * ⚠️ **只置位、绝不清零**：`CNNT_SYS+0x34`(0x20359034) 的 bit30 是
+     *    `usb_device_48m_clk_en`（复位默认 1），bit31 是 `usb_device_rst_en`。
+     *    之前有人整字写 0 把这颗时钟清掉 → CDC 和 JTAG 一起失联、只能断电
+     *    （README §6.17）；我这次手贱去脉冲 bit31 也把板子搞死过一次。
+     *    所以这里**只做 |=**，不动任何其它位。 */
+    S31_REG32(S31_CNNT_USB_DEVICE_CTRL) |= S31_CNNT_USB_48M_CLK_EN;
+    S31_REG32(S31_USJ_CONF0) |= S31_USJ_CONF0_PAD_ENABLE;
+
     /* 2. 堆：用链接脚本划出来的那段（不是静态数组，能吃到 ~460KB） */
 #if defined(RT_USING_USER_MAIN) && defined(RT_USING_HEAP)
     rt_system_heap_init(__heap_start, __heap_end);

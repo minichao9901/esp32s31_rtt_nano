@@ -72,7 +72,10 @@
 #define FINSH_USING_MSH
 #define FINSH_THREAD_NAME           "tshell"
 #define FINSH_THREAD_PRIORITY       20
-#define FINSH_THREAD_STACK_SIZE     4096
+/* 4096 → 8192（2026-09-25）：`sf` 系列命令把 SFUD 那几层调用都压在 tshell 线程上
+ * （sfud_device_init + 页编程的 260 字节写缓冲 + 移植层的 5 条 message 链），
+ * 实测开着诊断日志时 4096 只剩 496 字节余量 —— 加一倍换个安心，代价仅 4KB RAM。*/
+#define FINSH_THREAD_STACK_SIZE     8192
 #define FINSH_USING_HISTORY
 #define FINSH_HISTORY_LINES         5
 #define FINSH_USING_SYMTAB

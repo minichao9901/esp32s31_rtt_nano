@@ -41,6 +41,15 @@
 #define S31_USJ_INT_TX_EMPTY         (1u << 3)  /* SERIAL_IN_EMPTY_INT（TX FIFO 空）*/
 #define S31_USJ_CONF0_PAD_ENABLE     (1u << 14) /* :622 */
 
+/* USB 设备块的时钟/复位（CNNT_SYS+0x34，出处 soc/esp32s31/register/soc/cnnt_sys_reg.h:293-315）
+ *   bit30 = usb_device_48m_clk_en（**复位默认 1**）    bit31 = usb_device_rst_en（默认 0）
+ * 🚨 这个寄存器只能**读-改-写**：整字写 0 会把 bit30 一起清掉 → USB 设备块整块停振 →
+ *    CDC 和 JTAG 同时失联、只能物理断电（README §6.17 踩过）。*/
+#define S31_CNNT_SYS_BASE            0x20359000u
+#define S31_CNNT_USB_DEVICE_CTRL     (S31_CNNT_SYS_BASE + 0x34u)
+#define S31_CNNT_USB_48M_CLK_EN      (1u << 30)
+#define S31_CNNT_USB_RST_EN          (1u << 31)
+
 /* ---- CLIC（中断控制器）---- */
 #define S31_CLIC_BASE        0x10800000u   /* soc/clic_reg.h:17 */
 #define S31_CLIC_CTRL_BASE   0x10801000u   /* soc/clic_reg.h:18 */
