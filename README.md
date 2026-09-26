@@ -108,7 +108,14 @@ pwsh -File tools\reset_probe.py COM43 5          # 板子不理人时手动拉 E
 | `lcd [demo\|fill <色>\|clk <hz>]` | 外接 SPI 屏（AXS15352 240×296）：`lcd demo` = 8 色 × 2 轮刷屏，`lcd fill r\|g\|b\|black\|white\|rg\|gb\|rb` 单色，`lcd clk 10000000` 降时钟（花屏时用） |
 | `sf probe <spi_dev>` | **官方 SFUD 命令**：识别外接 flash（如 `sf probe flash0`；⚠️ 每次复位后要重敲） |
 | `sf read/erase/write/status` | 官方 `sf` 的读写擦（`sf read <addr> <size>`、`sf erase <addr> <size>`、`sf write <addr> <b0> <b1>…`） |
-| `list device` | 看设备框架里的设备 —— 外接 flash 是块设备 **`spi_flash0`**（2048×4KB，留给 DFS 用） |
+| `list device` | 看设备框架里的设备 —— 外接 flash 是块设备 **`spi_flash0`**（2048×4KB），板载 flash 是 **`onboard0`**（16384×512B） |
+| `onboard [-t]` | 板载 flash 磁盘：容量/偏移；`-t` 强制重跑"擦→写→读回"自检（见 §5.12） |
+| `mkfs <dev>` / `mount <dev> <path> <fs>` / `umount` / `ls` / `cat` / `df` / `mkdir` / `echo <s> <file>` / `rm` | **DFS + elmfat（官方组件）** 的文件操作 —— `mkfs onboard0` → `mount onboard0 / elm`（见 §5.12） |
+| `msc start\|stop\|status` | 把 `onboard0` 变成 PC 上的 U 盘（USB-HS 口，CherryUSB 官方 MSC 类，见 §5.13） |
+| `sound [-m]` | PWM 放音设备 `sound0` 状态；`-m` 量 1 秒实际采样率 + 占空比范围（见 §5.14） |
+| `tone <hz> [ms]` | 放一段正弦（不依赖文件系统；省略 ms = 后台一直响，`tone 0` 停） |
+| `wav_play [-i] [-v n] [-l 秒] <文件>` | 放 FAT 里的 WAV（`-i` 只看文件头，见 §5.14） |
+| `rtt` | SEGGER RTT 控制台状态（控制块地址、缓冲水位，见 §5.15） |
 
 ---
 
@@ -132,7 +139,12 @@ pwsh -File tools\reset_probe.py COM43 5          # 板子不理人时手动拉 E
 | 外接屏 | ✅ `drv_lcd_axs15352.c`：240×296 SPI 屏，`lcd demo` 8 色 × 2 轮（70.1 ms/帧），**屏上目视确认** |
 | reboot | ✅ TIMG0 MWDT 整片复位（`rst:0x7` HP 看门狗0），起来后 320MHz 正常 |
 | 复位 | ✅ 四个看门狗全部处理（RTC_WDT / TIMG0-1 MWDT / **超级看门狗 SWD**）；开机自报复位原因 |
-| 堆 | ✅ ~425 KB（链接脚本切出来的 RAM 区） |
+| 堆 | ✅ ~107 KB（链接脚本切出来的 RAM 区；DFS+USB+audio 加进来后从 175KB 降下来的） |
+| **DFS + elmfat** | ✅ 官方 `components/dfs/dfs_v1` + elmfat：**板载 flash `onboard0` 挂 `/`、外接 flash `spi_flash0` 挂 `/ext`**，读写/df 都实测过（§5.12） |
+| **板载 flash 块设备** | ✅ `drv_flash_onboard.c`：ROM 的 `esp_rom_spiflash_*` + 4KB 擦除块的读-改-擦-写，划 flash `0x400000` 起 8MB 当盘（§5.12） |
+| **USB MSC** | ✅ 官方 CherryUSB（RT-Thread 自带）+ 本工程胶水：USB-HS 口枚举成 U 盘，PC 能格式化/拷文件、板子挂载后能读回（§5.13） |
+| **音频** | ✅ 官方 audio 框架 + `drv_audio_pwm.c`（LEDC PWM，GPIO20）：`tone`/`wav_play` 实测 16kHz 采样率精确、8/16 位 WAV 都能放（§5.14） |
+| **SEGGER RTT** | ✅ 官方源码 + `tools/rtt.py`（自己实现主机端，走 OpenOCD telnet）：**USB-CDC 哑了也能看日志、还能敲命令**（§5.15） |
 | 镜像大小 | 约 50 KB（`.bin`，含 finsh + 三个外设驱动） |
 
 > ⚠️ **板上那颗 16MB flash 挂在 SPI0/1（专用脚），不在 GPSPI2 上**；`flash0` 指的是 J2 上
@@ -539,7 +551,157 @@ INIT_COMPONENT_EXPORT(s31_spi_flash_init);   /* 组件级：保证跑在设备�
 > （提交 `0d39e26`，`bsp/sfud/port/`），需要时可以从历史里取回。
 ---
 
-## 6. 踩过的坑（现象 → 根因 → 修法）
+## 5.12 板载 flash 块设备 + elmfat（FatFs）：`onboard0` / `spi_flash0`
+
+**先说结论：两片 flash 可以同时挂成两个 FAT 卷，互不干扰。**
+
+```text
+msh /> mkfs onboard0              # 板载 8MB 划出来的盘（第一次要先格式化）
+msh /> mount onboard0 / elm       # ⚠️ 挂 "/"（DFS v1 没有虚拟根目录，见坑 #28）
+msh /> mkdir /ext
+msh /> mkfs spi_flash0            # 外接 W25Q64（4KB 扇区）
+msh /> mount spi_flash0 /ext elm
+msh /> ls /                       # /  = 板载；/ext = 外接
+msh /> echo hello /a.txt          # 写文件（echo "<串>" <文件>）
+msh /> cat /a.txt
+msh /> df                         # 7.9 MB [16336 block, 512 bytes per block]
+```
+
+### 块设备怎么来的（`bsp/drv_flash_onboard.c`，~330 行）
+
+板载 flash 是**我们自己正跑着的那一片**（app.bin 烧在 `0x2000`），RT-Thread 下没有任何现成
+驱动能碰它，所以这个文件自己提供一个 `RT_Device_Class_Block`：
+
+| 事 | 做法 | 为什么 |
+|---|---|---|
+| 读/擦/写 | ROM 的 `esp_rom_spiflash_read/write/erase_sector`（地址在 linker.ld 里 `PROVIDE`） | 它是 IDF 二级 bootloader 用的同一套，**擦写期间 SPI1 与 cache 的互斥由 ROM 自己管**；我们没链 IDF，拿不到 `cache_disable`/IPI 那套 |
+| 关中断 | 每次 ROM 调用前后 `rt_hw_interrupt_disable/enable` | 本工程代码/数据**全在内部 RAM**（SRAM 不走 cache），操作期间不会有 flash 取指/取数 —— 这条是 boot_msc_s31 真板验证过的 |
+| 扇区 | **512B**（不是 4KB 擦除粒度） | FAT 与 USB MSC 都是 512B 逻辑块 → 一个块设备同时喂 `dfs_mount` 和 MSC，谁都不用换算；4KB 的账在 `write` 内部用"读-改-擦-写"吃掉 |
+| write | 按 4KB 块做 RMW，并跳过两种"其实不用擦"的情况：内容一模一样 / `(~old & new)==0`（只把 1 写成 0） | FAT 会反复重写同一份目录与 FAT 表；一次 4KB 读 ~0.5ms，换掉动辄 45ms 的擦除 |
+| 自检 | 开在 `0x100000` 的自检扇区：标记在 → 只读验证；不在 → 擦写读一次 | ROM 那条路**参数不对就静默失败**，不验一次根本不知道能不能写 |
+
+区域划分（16MB 全片，`README` 只此一处说，改的时候一起改）：
+
+```text
+0x000000 ┌──────────────────────────────┐
+0x002000 │ 本固件 app.bin（~340KB）      │ ← bootROM 从这里加载二级镜像
+0x100000 │ 自检扇区（4KB，驱动独占）      │
+0x400000 │ ★ 磁盘区 8MB → onboard0       │ ← 挂 FAT / 给 PC 当 MSC 盘
+0xC00000 │ 空闲                          │
+0x1000000└──────────────────────────────┘
+```
+
+🚨 **磁盘区绝不能和 app.bin 重叠**（擦掉正在跑的镜像 = 立刻变砖）。
+🚨 之后若烧 IDF 固件，这块盘会被 IDF 的 app 分区覆盖 —— 属预期（换固件就换用途）。
+
+### 为什么 `RT_DFS_ELM_MAX_SECTOR_SIZE` 必须是 4096（rtconfig.h 里有长注释）
+
+FatFs 挂载时会 `disk_ioctl(GET_SECTOR_SIZE)` 问设备扇区大小；官方 SFUD 移植层把块设备的
+`bytes_per_sector` 定成**擦除粒度 4KB**，而 `dfs_elm.c` 一看到 `bytes_per_sector > FF_MAX_SS`
+就直接拒挂。所以 `FF_MAX_SS` 必须 ≥4096 —— 好在 FatFs 这时进"可变扇区"模式，
+**每个卷各按自己设备报的大小建 FAT**：板载 512B、外接 4KB，互不影响。
+
+---
+
+## 5.13 CherryUSB MSC：把 `onboard0` 变成 PC 上的 U 盘
+
+```text
+msh /> msc start                  # 拉起 USB-HS（PC 上出现"可移动磁盘"）
+（PC 上格式化 / 拷文件 / 安全弹出）
+msh /> msc stop
+msh /> mount onboard0 / elm       # 现在板子能看到 PC 刚写进去的文件
+msh /> ls /                        # STAR8.WAV / STAR16.WAV / a.txt ...
+```
+
+分层（**官方代码一行没改**）：
+
+| 层 | 文件 | 说明 |
+|---|---|---|
+| 协议栈 | `components/drivers/usb/cherryusb/core/usbd_core.c` | RT-Thread 源码树自带 |
+| MSC 类 | `.../class/msc/usbd_msc.c` | "U 盘"类 |
+| 官方 demo | `.../demo/msc_ram_template.c` | 开 `RT_CHERRYUSB_DEVICE_TEMPLATE_MSC_BLKDEV` 后走**"盘 = RT-Thread 块设备"**那条分支（设备名见 `bsp/usb_config.h` 的 `CONFIG_USBDEV_MSC_BLOCK_DEV_NAME="onboard0"`） |
+| DWC2 控制器 | `.../port/dwc2/usb_dc_dwc2.c` | ip 核驱动，与厂商无关 |
+| **S31 胶水** | **本工程 `bsp/drv_usb_msc.c`** | 官方只提供了 st/gd/nation/hc/kendryte/esp 的胶水，**没有 S31** —— 这里补：PHY/时钟/复位顺序、FIFO 划分、CLIC 中断 |
+
+真板实测：PC 上出现 `USB 大容量存储设备` + 盘符（`Get-Disk` 报 `Espressi S31 Onboard Flas` 8MB），
+**PC 拷进去的 `STAR8.WAV` 板子挂载后能原样读出来**；`wav_play -i` 的头字段（16000Hz/1ch/8bit）
+与 PC 侧文件一致。
+
+⚠️ 使用顺序（否则文件系统会写花）：PC "安全弹出" → `msc stop` → `mount onboard0 / elm`。
+盘被 PC 用着的时候**别**在板子上挂同一个卷。
+
+---
+
+## 5.14 LEDC PWM 音频 + WAV 播放（走官方 audio 框架）
+
+**S31 没有 DAC**（`soc_caps.h` 里连 `SOC_DAC_SUPPORTED` 都没有），所以"内置外设直接出声"
+只剩 PWM/SDM。选 **LEDC PWM**：一个任意 GPIO + 一个 RC 低通就够。
+
+```text
+msh /> tone 440 500            # 放 500ms 的 440Hz 正弦（验证通路，不依赖文件系统）
+msh /> tone 440                # 后台一直响
+msh /> tone 0                  # 停
+msh /> mount onboard0 / elm
+msh /> wav_play -i /STAR8.WAV  # 只看文件头
+msh /> wav_play /STAR8.WAV     # 放（8/16 位、单/双声道、8k~48kHz PCM 都行）
+msh /> wav_play -v 2 /STAR8.WAV  # 音量减半（右移 2 位）
+```
+
+**接线**：`GPIO20`（J2-26）→ RC 低通（1kΩ + 100nF，截止 ~1.6kHz）→ 小喇叭；
+GND 用 J2 的 33/34/37/38。⚠️ GPIO 直推喇叭只有几 mA（声音很小），要响就经功放
+（板载 NS4150B 或小功放板）。载波 156.25kHz（XTAL 40MHz ÷ 2⁸），远高于音频带，RC 一滤就干净。
+
+**分层**（框架是官方的 `components/drivers/audio/dev_audio.c`）：
+
+```text
+应用 rt_device_write(sound0, ...)                    ← app/wav_player.c
+  └─ _audio_dev_write：切 4KB 块进内存池 + 数据队列
+       └─ ops->start(REPLAY)：本工程 drv_audio_pwm.c 打开采样时钟（SYSTIMER TARGET1 周期模式）
+       └─ 硬件"播完一半" → ISR 调 rt_audio_tx_complete()
+            └─ 框架把下一块 memcpy 进 ops->buffer_info() 报给它那块缓冲（乒乓两半）
+```
+
+驱动只做三件事：报 ping-pong 缓冲几何、按采样率把样本写成占空比、每半块回调一次。
+`transmit` 留 `NULL`（框架直接往我们报的缓冲里写 —— 和官方 STM32 SAI 驱动一个套路）。
+
+**实测数字**（`sound -m`）：请求 16000Hz → **ISR 16000 次/秒**（精确）；
+`wav_play -l 2 /STAR8.WAV` = 32000 字节 / **2002ms**、`STAR16.WAV` = 64000 字节 / **2030ms**
+—— 都是**实时**（8bit/16kHz = 15.6kB/s、16bit = 31.2kB/s）。
+
+⚠️ 44.1kHz 只能按 363 拍取整（实际 44077Hz，-0.05%，听不出来，但别拿它做测速基准）。
+
+---
+
+## 5.15 SEGGER RTT：USB-CDC 哑了也能看日志（还能敲命令）
+
+> 为什么加它：USB-Serial/JTAG 那个控制台**会哑**（主机不再收 IN 端点 / 开端口时的
+> DTR-RTS 把芯片按进下载模式），而日志是查别的问题时唯一的眼睛。RTT 走**调试器读内存**，
+> 不依赖 CDC 握手、不独占串口。本工程把它接成"第二控制台"：日志同时喂两边，
+> 输入也从两边进（都注入到 USJ 驱动那同一个 RX 环）。
+
+```powershell
+# 看 6 秒日志
+python tools\rtt.py
+
+# 敲命令（语法和 msh.py 一样，| 分隔）
+python tools\rtt.py --reset "mount onboard0 / elm|ls /|wav_play /STAR8.WAV" 8
+
+# 当监视器（Ctrl+C 停）
+python tools\rtt.py --keep
+```
+
+- **主机端是我们自己实现的**（`tools/rtt.py`）：这份 OpenOCD 只编了 `rtt server`
+  （`help rtt` 里没有 `rtt setup/start`），所以 RTT 协议在 Python 里写：从 ELF 的
+  `_SEGGER_RTT` 符号拿到控制块地址（拿不到就扫 RAM 找 `"SEGGER RTT"`），
+  用 OpenOCD 的 telnet 口（4444）`dump_image`/`load_image`/`mdw`/`mww` 搬数据。
+- 固件侧：`bsp/segger_rtt/` 是 **SEGGER 官方源码一字未改**（只改官方留给我们改的
+  `SEGGER_RTT_Conf.h`），`bsp/drv_rtt.c` 做三件事：把控制台输出镜像进 RTT、
+  开一个低优先级线程把 RTT 输入注入 shell、给一条 `rtt` 状态命令。
+- 🚨 **`--reset` 很关键**：开 OpenOCD **不保证**复位芯片，上一轮的挂载/播放状态会留着
+  （同一个启动周期里重复 `mount` 会失败），要可复现就从复位开始。
+
+---
+
 
 1. **`INIT_*_EXPORT` 的函数一个都不执行**（tick 不开、msh 不起，但版本号和 main 都正常）
    → `--gc-sections` 把 `.rti_fn.*` 段当"没人引用"删了 → 链接脚本里 `KEEP(*(SORT(.rti_fn*)))`。
@@ -690,6 +852,59 @@ INIT_COMPONENT_EXPORT(s31_spi_flash_init);   /* 组件级：保证跑在设备�
       ① 芯片压根没启动到 app（`boot:0x6f (DOWNLOAD)` + `waiting for download`，
       是主机侧 DTR/RTS 把它按进下载模式了，**会粘住**，只能物理断电）；
       ② app 在跑但控制台哑（本条）。JTAG 读 PC 是分辨两者最快的手段：0x2F80xxxx = ROM、0x2F0xxxxx = app。
+26. 🚨🚨 **块设备加了 `RT_DEVICE_FLAG_STANDALONE` ⇒ 同一个启动周期里只能 `mount` 一次**
+    （2026-09-26，为它白查了两轮）：
+    - **现象**：`mount onboard0 / elm` **第一次成功、之后再 mount 就 `failed!` + `-1`**；
+      `msc start`/`msc stop` 之后也挂不上。而 `mkfs onboard0` 之后却能挂 —— 极像"文件系统坏了"。
+      （中途还去追了"Windows 改过的卷挂不上"、"get_fattime 让 mkfs 崩"这些岔路。）
+    - **根因**：STANDALONE 的语义是"只能被打开一次"，而 `rt_device_open()` 在**调用驱动的
+      open 回调之前**就对着 `open_flag & RT_DEVICE_OFLAG_OPEN` 判了一次，第二次直接
+      `-RT_EBUSY`。`dfs_mount()` 拿到这个错误会**在调文件系统 mount 之前**返回 -1，
+      所以连 `dfs_elm_mount` 都没进（那两行临时打印一行都没出，就是这个信息把范围缩小的）。
+      为什么 `mkfs` 之后又能挂：`dfs_elm_mkfs()` 结尾会 `rt_device_close()`，把 ref 减回 0 了。
+    - **修法**：块设备**去掉 STANDALONE**（它天生要被"FAT 挂载 + MSC"两头打开）。
+      ⚠️ **官方 SFUD 那个块设备是带 STANDALONE 的**（`dev_spi_flash_sfud.c`），所以
+      `spi_flash0` 也有同样的脾气：同一个启动周期里只能挂一次。
+    - **教训**：`dfs_mount` 返回 -1 时，**先怀疑"设备打不开"**（`rt_device_open` 的返回值被它
+      吞掉了）—— 最快的定性手段是在自己驱动的 `open` 回调里打印调用者和 `ref_count`。
+27. 🚨 **`mkfs onboard0` 会让板子"哑掉"**：newlib 的 `_gettimeofday` 桩**是往地址 0 写**，
+    不是返回 ENOSYS（链接日志那句 `warning: _gettimeofday is not implemented and will always fail`）。
+    `f_mkfs` 要一个随机种子 → elmfat 的 `get_fattime()` → `time()` → `_gettimeofday` →
+    **store access fault（mtval=0）** → 进异常停机。修法：自己在 `syscalls_stub.c` 里实现
+    `_gettimeofday`（固定基准 2026-01-01 + 开机 tick）。
+    ⚠️ 顺带：异常停机时那几行 `*** S31 EXCEPTION ***` 是塞进**发送环**的，而排空靠 tick 中断 ——
+    进了 `for(;;)` 中断就再也不来，所以主机什么也看不到（现象="突然无声"）。现在
+    `s31_exception()` 里会**主动 `s31_usj_flush()`** 再把环推出去。
+28. 🚨 **DFS v1 没有"虚拟根目录"**：`ls /` 会说 `No such directory`，因为 DFS v1 的每个路径
+    都必须落在**已挂载的文件系统**上（`dfs_filesystem_lookup()` 找不到就 -ENOENT）。
+    `mkdir /disk` 一样会静默失败。→ **把第一个文件系统挂到 `/`**，第二个挂到它的子目录
+    （`mkdir /ext` 之后 `mount spi_flash0 /ext elm`）—— `dfs_mount()` 对 `/` 和 `/dev`
+    有特例（跳过"路径必须存在"的检查），所以挂 `/` 是唯一不用先有目录的地方。
+29. 🔧 **编 RT-Thread 的 DFS/audio 时缺的那几块**（都是"宏没开/文件没编"，不是脏数据）：
+    - `dfs.h` 要的 `<sys/statfs.h>` **newlib 根本没有**，`<dirent.h>` 还必须命中 RT-Thread
+      那份（它认 `HAVE_DIR_STRUCTURE`，见 `dfs_elm.c:27`）→ 加 RTT 的
+      `components/libc/compilers/{common,newlib}` 到 include，**并且全局 `-D_POSIX_C_SOURCE=1`**
+      （RTT 的 `sys/{select,time,signal}.h` 会盖住 newlib 同名头，少了这个宏会报一堆
+      `unknown type name 'clock_t'/'clockid_t'/'pid_t'`）。⚠️ 只给 DFS 那几个文件加不行 ——
+      `msh.c`/`shell.c` 也会间接 include `dfs.h`，只能全局加（和 RTT 自己的构建一致）。
+    - `ls/cat/mkfs/mount/df` 这些命令**在 `components/finsh/msh_file.c`**（不是 dfs 里），
+      它的守卫是 `defined(RT_USING_FINSH) && defined(DFS_USING_POSIX)` → `DFS_USING_POSIX` 必须开。
+    - `timegm()`：newlib 只在 `_GNU_SOURCE` 下导出，而我们把 POSIX 可见性钉在 1990 →
+      自己在 `syscalls_stub.c` 里实现（`days_from_civil`，`dfs_elm.c:841` 拿它填 `st_mtime`）。
+    - audio 框架要 `RT_USING_MEMPOOL`（replay 缓冲是内存池）**和** `RT_USING_DEVICE_IPC`
+      （`rt_data_queue`/`rt_completion`/`rt_ringbuffer` 在 `components/drivers/ipc/`，
+      还要带官方的 `__RT_IPC_SOURCE__`）。
+30. 🚨 **SYSTIMER 周期模式：初始目标值必须给"当前计数 + period"**（否则**只中断一次**）。
+    周期模式只是在"上一次目标值"上累加 period，而比较是**精确匹配** —— 写 0 的话，
+    第一个周期（0+period）早被计数器甩在身后，于是只补一次中断就再也不来。
+    现象很有画面感：`sound -m` 报 **ISR 0 次**、占空比冻结在一个值、而 tone 的写入线程
+    因为"队列没人消费"永远阻塞（看起来像死机）。修法：`s31_systimer_get_ticks() + period`
+    写进 TARGET1_HI/LO，再 `COMP1_LOAD`，最后才 `WORK_EN`。
+31. 🔧 **别在 shell 线程里"生成到天荒地老"**：第一版 `tone <hz>`（不带 ms）在 tshell 里
+    每点都调 `sinf()` 且样本序号无限增长 → 参数巨大 → 落进 libm 的
+    `__kernel_rem_pio2f` 慢路径 → **shell 再也回不来**（JTAG 采 PC 才发现是在 libm 里磨，
+    而不是"死机"）。修法：正弦用运行时建的 256 项查表、缓冲预生成 1 秒、
+    不限时的用**后台线程**反复喂。
 
 ---
 

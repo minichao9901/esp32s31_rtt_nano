@@ -10,6 +10,9 @@
 
 #define S31_REG32(addr)      (*(volatile uint32_t *)(uintptr_t)(addr))
 #define S31_REG8(addr)       (*(volatile uint8_t  *)(uintptr_t)(addr))
+/* 读-改-写的两个小助手（有字段默认值是"1"的寄存器必须用它们，整字写会清掉别的位）*/
+#define S31_SETBITS(a, m)    do { S31_REG32(a) |=  (uint32_t)(m); } while (0)
+#define S31_CLRBITS(a, m)    do { S31_REG32(a) &= ~(uint32_t)(m); } while (0)
 
 /* ---- 内存窗口（soc/esp32s31/include/soc/soc.h:152 / ld.hp_mem_defs:9）---- */
 #define S31_RAM_LOW          0x2F000000u
@@ -123,6 +126,103 @@
 #define S31_LP_SYS_BASE        0x20700000u
 #define S31_LP_CLKRST_BASE     0x20701000u  /* LP_AONCLKRST：复位原因 / CPLL 分频 */
 #define S31_PMU_BASE           0x20704000u  /* PMU：PSRAM 专用 1.8V LDO + MPLL 掉电控制 */
+
+/*===========================================================================
+ * USB OTG HS（DWC2 @0x20300000）+ USB-Serial/JTAG 的时钟/复位
+ *
+ * 2026-09-26 从 boot_msc_s31/bsp/s31_regs.h 合并 —— 那边的 MS​C 盘**真板跑通过**，
+ * 这些位号是踩过坑之后核对过的，别凭印象改：
+ *   · `CNNT_SYS` 的偏移必须从 IDF 的 struct 头**逐字段累加**（struct 里有
+ *     `uint32_t reserved_008[2];` 这种没有 volatile 的字段，漏算就整体偏 8 字节，
+ *     把 USB 时钟写到隔壁寄存器上 → 控制器一直没时钟、GHWCFG 全 0）。
+ *   · `sys_usb_otg20_ctrl` 的三路复位**默认是"按住"的**，而且按住期间对该寄存器的
+ *     写会被吃掉 → 顺序必须是"先放复位（先 PHY 后控制器）→ 再开时钟"。
+ *   · `sys_hp_usb_device_ctrl` 的 bit30 复位默认 = 1，**只能读-改-写**：
+ *     整字写 0 会把 USB 设备块（CDC + JTAG）一起停振，只能物理断电恢复。
+ *===========================================================================*/
+#define S31_USB_OTGHS_BASE     0x20300000u  /* DWC2 HS 控制器 */
+#define S31_USB_UTMI_BASE      0x20380000u  /* UTMI PHY 控制寄存器 */
+
+/* HP_SYS_CLKRST.usb_otghs_ctrl0 @+0xac：APB/SYS 时钟门控 */
+#define S31_CLKRST_USB_OTGHS_CTRL0  (S31_HP_SYS_CLKRST_BASE + 0xacu)
+#define S31_USB_CLK_APB_EN          (1u << 0)
+#define S31_USB_CLK_SYS_EN          (1u << 1)
+
+/* CNNT_SYS.sys_usb_otg20_ctrl @+0x30 */
+#define S31_CNNT_USB_CLK_CTRL       (S31_CNNT_SYS_BASE + 0x2cu)
+#define S31_CNNT_USB_OTG20_CTRL     (S31_CNNT_SYS_BASE + 0x30u)
+#define S31_USB20_UTMIFS_CLK_EN     (1u << 23)
+#define S31_USB20_ULPI_CLK_EN       (1u << 24)
+#define S31_USB20_PHYREF_SRC_SEL    (3u << 25)  /* [26:25] 0=12M 1=25M 2=pad */
+#define S31_USB20_PHYREF_CLK_EN     (1u << 27)
+#define S31_USB20_PHY_RST_EN        (1u << 29)
+#define S31_USB20_AHB_RST_EN        (1u << 30)
+#define S31_USB20_APB_RST_EN        (1u << 31)
+
+/* HP_ALIVE_SYS.usb_ctrl @+0x24：D+/D- 15k 下拉（设备模式必须断开）*/
+#define S31_ALIVE_USB_CTRL          (S31_HP_ALIVE_SYS_BASE + 0x24u)
+#define S31_OTGHS_PHY_DMPULLDOWN    (1u << 2)
+#define S31_OTGHS_PHY_DPPULLDOWN    (1u << 3)
+#define S31_OTGHS_PHY_IDPULLUP      (1u << 4)
+
+/* HP_ALIVE_SYS.usb_otghs_ctrl @+0xb0：PHY PLL / suspendm 手动控制 */
+#define S31_ALIVE_USB_OTGHS_CTRL    (S31_HP_ALIVE_SYS_BASE + 0xb0u)
+#define S31_OTGHS_PHY_PLL_FORCE_EN  (1u << 0)
+#define S31_OTGHS_PHY_PLL_EN        (1u << 1)
+#define S31_OTGHS_PHY_SUSPENDM_FORCE_EN (1u << 2)   /* 复位默认=1，必须清 0 交给 DWC2 */
+#define S31_OTGHS_PHY_SUSPENDM      (1u << 3)
+#define S31_OTGHS_PHY_OTG_SUSPENDM  (1u << 7)
+
+/* LP_SYS.usb_ctrl @+0x100：挂起状态 / 唤醒清除 */
+#define S31_LP_SYS_USB_CTRL         (S31_LP_SYS_BASE + 0x100u)
+#define S31_LP_USB_WAKEUP_CLR       (1u << 2)
+#define S31_LP_USB_IN_SUSPEND       (1u << 3)
+
+/* USB_UTMI.fc_06 @+0x18：LS 模式支持 */
+#define S31_UTMI_FC06               (S31_USB_UTMI_BASE + 0x18u)
+#define S31_UTMI_FC06_LS_PAR_EN     (1u << 0)
+#define S31_UTMI_FC06_LS_KPALV_EN   (1u << 3)
+
+/* DWC2 控制器寄存器偏移（CherryUSB 的 dwc2 驱动自己会用，这里用于自检打印）*/
+#define S31_DWC2_GOTGCTL            0x000u
+#define S31_DWC2_GSNPSID            0x040u
+#define S31_DWC2_GHWCFG2            0x048u
+#define S31_DWC2_GUSBCFG            0x00cu
+#define S31_DWC2_GINTSTS            0x014u
+#define S31_DWC2_DCTL               0x804u
+#define S31_DWC2_DSTS               0x808u
+
+/* ---- SYSTIMER TARGET1（音频采样率时钟；TARGET0 被 1ms tick 占了）----
+ * 偏移按 IDF `soc/esp32s31/register/soc/systimer_struct.h` 的字段顺序累加得出
+ * （每寄存器 4 字节）：conf/unit_op[2]/unit_load_val[2×2]/target_val[3×2]/
+ * target_conf[3]/unit_val[2×2]/comp_load[3]/unit_load[2]/int_*……
+ * 与已有的 TARGET0 那组偏移（0x1c/0x20/0x34/0x50/0x54…）对得上，可互验。*/
+#define S31_SYSTIMER_TARGET1_HI     (S31_SYSTIMER_BASE + 0x24)
+#define S31_SYSTIMER_TARGET1_LO     (S31_SYSTIMER_BASE + 0x28)
+#define S31_SYSTIMER_TARGET1_CONF   (S31_SYSTIMER_BASE + 0x38)
+#define S31_SYSTIMER_COMP1_LOAD     (S31_SYSTIMER_BASE + 0x54)
+/* systimer_struct.h: conf.target1_work_en = bit23；int_ena/raw/clr/st 的 target1 = bit1 */
+#define S31_SYSTIMER_TARGET1_WORK_EN  (1u << 23)
+#define S31_SYSTIMER_T1_INT           (1u << 1)
+/* 中断源号（soc/interrupts.h：ETS_SYSTIMER_TARGET0/1/2 = 33/34/35）*/
+#define S31_ETS_SYSTIMER_TARGET1      34
+
+/* ---- LEDC（PWM 音频用；LEDC0 @0x20392000，出处 soc/esp32s31/ld/esp32s31.peripherals.ld）
+ * 寄存器布局（`soc/ledc_struct.h`，已冻结进 bsp/idf_headers）：
+ *   channel_group[0].channel[8]  每个 5 个寄存器：conf0/hpoint/duty_init/conf1/duty_r
+ *   timer_group[0].timer[4]      每个 2 个：conf/value
+ * 时钟在 HP_SYS_CLKRST.ledc_ctrl0（hp_sys_clkrst_reg.h:3275 → base+0x148）：
+ *   bit0 apb_clk_en / bit1 rst_en / bit2 force_norst / bit[4:3] clk_src_sel / bit5 clk_en
+ * GPIO 矩阵信号号见 soc/gpio_sig_map.h：LEDC0 通道 0..7 = 126..133 */
+#define S31_LEDC0_BASE                 0x20392000u
+#define S31_HP_SYS_CLKRST_LEDC_CTRL0   (S31_HP_SYS_CLKRST_BASE + 0x148u)
+#define S31_LEDC_CLK_APB_EN            (1u << 0)
+#define S31_LEDC_CLK_RST_EN            (1u << 1)
+#define S31_LEDC_CLK_FORCE_NORST       (1u << 2)
+#define S31_LEDC_CLK_SRC_SEL_S         3
+#define S31_LEDC_CLK_SRC_SEL_M         (3u << 3)
+#define S31_LEDC_CLK_EN                (1u << 5)
+#define S31_LEDC_SIG_OUT_CH0           126u      /* LEDC0_LS_SIG_OUT_PAD_OUT0_IDX */
 
 /* PSRAM 的虚拟地址窗口（soc.h:143 SOC_EXTRAM_LOW/HIGH）*/
 #define S31_PSRAM_VADDR        0x50000000u

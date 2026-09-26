@@ -47,6 +47,8 @@ static void s31_default_isr(int vector, void *param)
 }
 
 /* 注意：异常分支里**不要**用 rt_kprintf 的常规路径之外的东西，也不要返回 */
+void s31_usj_flush(rt_uint32_t max_pumps);      /* bsp/drv_usj.c：阻塞把发送环排空 */
+
 static void s31_exception(rt_uint32_t mcause)
 {
     rt_uint32_t mepc, mtval, mstatus;
@@ -60,6 +62,11 @@ static void s31_exception(rt_uint32_t mcause)
     rt_kprintf("  mtval   = 0x%08x\n", (unsigned)mtval);
     rt_kprintf("  mstatus = 0x%08x\n", (unsigned)mstatus);
     rt_kprintf("(halt)\n");
+
+    /* 🚨 这几行是塞进发送环的，而排空靠 tick 中断 —— 进了下面那个 for(;;)
+     *    中断就不来了。不在这里主动刷一次，主机收到的就是"突然无声"
+     *    （2026-09-26 为这个白查一轮：其实异常信息一直都在环里躺着）。*/
+    s31_usj_flush(20000u);
 
     for (;;) {
         /* 停机：继续执行故障指令只会无限刷屏 */

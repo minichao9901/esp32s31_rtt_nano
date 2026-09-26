@@ -128,10 +128,23 @@ rt_uint32_t s31_usj_tx_pending(void)
     return (s_tx_head - s_tx_tail) & USJ_TX_RING_MASK;
 }
 
+/*===========================================================================
+ * 控制台输出的"第二只眼睛"：SEGGER RTT（bsp/drv_rtt.c）
+ *
+ * s31_usj_put_bytes() 是**所有**控制台输出的必经之路（rt_kprintf /
+ * rt_hw_console_output / console 设备 write 三条路最后都落到这儿），
+ * 所以镜像挂钩放这一处就够。
+ * 为什么要镜像：USB-Serial/JTAG 那个 CDC 会有"主机不再收 IN 端点"的哑巴状态，
+ * 一旦哑了就什么都看不到；RTT 走调试器的内存读，不受这个影响（2026-09-26 加）。
+ *===========================================================================*/
+void s31_console_mirror(const char *str, rt_size_t len);   /* bsp/drv_rtt.c */
+
 /* 往发送环形缓冲里塞 len 个字节（'\n' 自动补 '\r'），并立刻尝试灌进 FIFO */
 void s31_usj_put_bytes(const char *str, rt_size_t len)
 {
     rt_size_t i;
+
+    s31_console_mirror(str, len);        /* 同时喂给 RTT（不阻塞、满了就丢）*/
 
     for (i = 0; i < len; i++) {
         if (str[i] == '\n') {
@@ -140,6 +153,22 @@ void s31_usj_put_bytes(const char *str, rt_size_t len)
         usj_ring_put(str[i]);
     }
     s31_usj_tx_pump();
+}
+
+/*===========================================================================
+ * 阻塞把发送环排空（**只能在异常/致命路径里用**）
+ *
+ * 🚨 为什么需要它（2026-09-26 踩过）：发送环本来靠 tick 中断周期性 `tx_pump()`
+ *    往外灌。一旦进 `s31_exception()` 的那个 `for(;;)`，中断再也不来 ——
+ *    刚打进去的 "*** S31 EXCEPTION ***" 就永远躺在环里，主机什么也收不到，
+ *    现场看起来就是"板子无声无息地死了"。查这个异常因此白跑了一轮。
+ * 这里自己轮询 FIFO 把它推出去；max_pumps 兜底，别在坏掉的总线上死等。
+ *===========================================================================*/
+void s31_usj_flush(rt_uint32_t max_pumps)
+{
+    while (s31_usj_tx_pending() != 0u && max_pumps-- > 0u) {
+        s31_usj_tx_pump();
+    }
 }
 
 void rt_hw_console_output(const char *str)

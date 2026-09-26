@@ -113,6 +113,37 @@ static void s31_usj_rx_isr(int irq, void *param)
     }
 }
 
+/*===========================================================================
+ * 从**别的**输入通道往控制台 RX 环里塞字节（目前只有 SEGGER RTT 用，见
+ * bsp/drv_rtt.c）。这样 RTT 的输入和 USB-CDC 的输入走**同一条**交付路径：
+ * 同一个环、同一个 rx_indicate → finsh 不用知道字符是从哪来的。
+ * 关中断写环，和 RX 中断互斥（和 ISR 里那段是同一个套路）。
+ *===========================================================================*/
+void s31_usj_rx_inject(const char *buf, rt_size_t len)
+{
+    rt_size_t i;
+    rt_base_t level;
+
+    if ((buf == RT_NULL) || (len == 0u)) {
+        return;
+    }
+
+    level = rt_hw_interrupt_disable();
+    for (i = 0; i < len; i++) {
+        rt_uint32_t next = (s_rx_head + 1u) & USJ_RX_RING_MASK;
+        if (next == s_rx_tail) {
+            break;                              /* 满则丢，绝不阻塞 */
+        }
+        s_rx_ring[s_rx_head] = (rt_uint8_t)buf[i];
+        s_rx_head = next;
+    }
+    rt_hw_interrupt_enable(level);
+
+    if (s_usj_dev.rx_indicate != RT_NULL) {
+        s_usj_dev.rx_indicate(&s_usj_dev, 1);
+    }
+}
+
 /* ---- 注册（device 级：早于 finsh 的 app 级，晚于调度器起来）------------- */
 
 static int s31_usj_dev_register(void)

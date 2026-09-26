@@ -166,6 +166,23 @@ SECTIONS
   PROVIDE(EFUSE         = 0x20715000);
   PROVIDE(CACHE         = 0x2C000000);
 
+  /* LEDC0 实例（bsp/drv_audio_pwm.c 用 IDF 的 soc/ledc_struct.h 按字段名写寄存器，
+     那份头里是 `extern ledc_dev_t LEDC0;`）。地址出处：
+     components/soc/esp32s31/ld/esp32s31.peripherals.ld:44 */
+  PROVIDE(LEDC0         = 0x20392000);
+  PROVIDE(LEDC0_GAMMA_RAM = 0x20392400);
+
+  /* 板载 flash 的 ROM 接口（bsp/drv_flash_onboard.c 用；地址出处
+     components/esp_rom/esp32s31/ld/esp32s31.rom.ld，与 boot_msc_s31 实测过的一致）。
+     🚨 擦/写/读都会先按 ROM 里那份 chip_size 做范围检查，而 bootROM 交棒时它只有
+        2MB —— 所以驱动里必须先调 config_param 把真实容量（16MB）告诉 ROM。*/
+  PROVIDE(esp_rom_spiflash_read          = 0x2f80016c);
+  PROVIDE(esp_rom_spiflash_write         = 0x2f800168);
+  PROVIDE(esp_rom_spiflash_erase_sector  = 0x2f800160);
+  PROVIDE(esp_rom_spiflash_erase_block   = 0x2f800164);
+  PROVIDE(esp_rom_spiflash_unlock        = 0x2f800170);
+  PROVIDE(esp_rom_spiflash_config_param  = 0x2f80017c);
+
   /* 读 PSRAM 芯片容量/mode register 用的 ROM 事务接口（rom/opi_flash.h）——
      psram_ctrlr_ll.h 的 psram_size_bytes() 就调这三个 */
   PROVIDE(esp_rom_spi_set_op_mode = 0x2f800124);

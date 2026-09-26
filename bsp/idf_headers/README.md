@@ -35,6 +35,25 @@
 - 顺序 = 编译器搜索 `-I` 的顺序，所以"第一个命中"和编译器看到的完全一致；
 - **45 个文件 / 约 2.4 MB**，来源见 [`_SOURCE.txt`](_SOURCE.txt)（含 IDF 版本与 commit）。
 
+## 📌 手工补进来的一个文件：`soc/ledc_struct.h`（2026-09-26）
+
+`bsp/drv_audio_pwm.c` 要按**字段名**写 LEDC 的寄存器（PWM 音频），而
+`sync_idf_headers.ps1` 的种子是"工程里所有 .c/.S 的 include 闭包" ——
+那个文件当时还没写、且本机 IDF 源码树临时抽风（`register\soc` 目录一会儿有文件
+一会儿 0 个），所以这一个文件是**从 GitHub 按本机 IDF 的 commit 直接取的**：
+
+```powershell
+curl.exe --proxy http://127.0.0.1:7890 -L -o soc/ledc_struct.h `
+  https://raw.githubusercontent.com/espressif/esp-idf/fff9895c8/components/soc/esp32s31/register/soc/ledc_struct.h
+```
+
+（62137 字节，与后来能从本地 IDF 树读到的那份**逐字节相同** —— 可以放心。）
+它 `#include <stdint.h>` 而已，自包含；`ledc_ll.h` 之类的**没有**拿，
+所以 LEDC 的**时钟源选择/位号**这些都写在 `bsp/s31_regs.h` 的 LEDC 段里（带出处注释）。
+
+> 下次重跑 `sync_idf_headers.ps1` 时，只要 `drv_audio_pwm.c` 还在（它 include 了这个头），
+> 这个文件会被正常纳入闭包 —— 到那时这节说明就可以删掉。
+
 ## 什么时候需要重新同步
 
 只有当 IDF 那边 **S31 的寄存器定义被修正** 时才需要，比如：

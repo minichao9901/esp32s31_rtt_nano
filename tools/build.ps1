@@ -87,8 +87,8 @@ if ($HaveSafe -ne $WantSafe) {
 $kernelExclude = @(
     'cpu_mp.c', 'scheduler_mp.c',   # 非 SMP
     'slab.c',                        # 未开 RT_USING_SLAB
-    'mempool.c',                     # 未开 RT_USING_MEMPOOL
-    'memheap.c',                     # 未开 RT_USING_MEMHEAP
+    'memheap.c',                     # 未开 RT_USING_MEMHEAP（mempool.c 现在**要编**了：
+                                     #   audio 框架的 replay 缓冲就是内存池）
     'signal.c'                       # 未开 RT_USING_SIGNALS
 )
 $kernelSrc = Get-ChildItem (Join-Path $Rtt 'src') -Filter *.c |
@@ -112,6 +112,11 @@ $otherSrc = @(
 )
 $otherSrc += @('shell.c', 'msh.c', 'msh_parse.c', 'cmd.c') |
              ForEach-Object { Join-Path $Rtt "components\finsh\$_" }
+# ★ msh_file.c：`ls / cat / mkdir / rm / cp / mv / cd / pwd / mkfs / mount / umount / df`
+#   全在这个文件里（RT-Thread 5.x 把它们从 dfs 挪到了 finsh），而且是
+#   `#if defined(RT_USING_FINSH) && defined(DFS_USING_POSIX)` —— 所以 DFS_USING_POSIX
+#   必须开，否则"文件系统起来了但一条命令都没有"。
+$otherSrc += (Join-Path $Rtt 'components\finsh\msh_file.c')
 # ③ RT-Thread 设备框架 + 三个基础外设的核心（经典接口，不走 RT_USING_DM）
 #    - core/device.c       设备框架本体
 #    - pin/dev_pin.c       标准 rt_pin_* + 自带 `pin` msh 命令
@@ -138,18 +143,75 @@ $otherSrc += @(
     (Join-Path $Rtt 'components\drivers\spi\dev_spi_flash_sfud.c')
 )
 
+# ⑤ DFS + elm-chan FatFs：**也是 RT-Thread 官方那套**，从源码树直接编
+#    - dfs_v1/src/{dfs,dfs_file,dfs_fs,dfs_posix}.c   虚拟文件系统本体
+#      （dfs_posix.c 编是因为 DFS_USING_POSIX 开着 —— msh 的文件命令靠它）
+#    - filesystems/elmfat/{ff,ffunicode,dfs_elm}.c   FatFs 本体 + 官方 diskio 移植层
+#    - filesystems/devfs/devfs.c                      /dev 下的设备节点
+#    - components/finsh/msh_file.c                     ls/cat/mkfs/mount/df 那排命令
+#    ⚠️ 版本选择：v5.2.2 的 dfs 分 v1/v2 两套，我们走 **v1**（RT_USING_DFS_V1），
+#       v2 是给 RT-Thread Smart 那套准备的（要 page cache / device ops）。
+#    ⚠️ 这些文件**单独一组编译**（$dfsSrc / $dfsExtra，见下面 $Common 之后）：
+#       它们要 RT-Thread 那套 POSIX 头 + _POSIX_C_SOURCE=1，而其余文件不需要。
+
+# ⑧ audio 设备框架（官方 components/drivers/audio/）+ 我们的 PWM 放音驱动 + WAV 播放器
+#    - dev_audio.c      框架本体（replay 内存池/数据队列/乒乓调度）
+#    - dev_audio_pipe.c 音频管道（record 用；一起编上，反正 --gc-sections 会掉）
+#    - bsp/drv_audio_pwm.c  LEDC PWM 放音设备（sound0），见该文件顶部
+#    - app/wav_player.c     `wav_play` 命令
+$otherSrc += @(
+    (Join-Path $Rtt 'components\drivers\audio\dev_audio.c'),
+    (Join-Path $Rtt 'components\drivers\audio\dev_audio_pipe.c')
+)
+
 $otherSrc += @('startup.S', 'trap_gcc.S', 'board.c', 'drv_usj.c', 'drv_usj_dev.c',
                'drv_systick.c', 'drv_clk.c', 'trap_handler.c', 'syscalls_stub.c') |
              ForEach-Object { Join-Path $Bsp $_ }
 # 外设驱动：写好一个就自动参与编译（还在写的时候就跳过）
 $otherSrc += @('drv_gpio.c', 'drv_spi.c', 'drv_i2c.c', 'drv_lcd_axs15352.c',
-               'drv_spi_flash.c') |
+               'drv_spi_flash.c', 'drv_flash_onboard.c', 'drv_rtt.c', 'drv_usb_msc.c',
+               'drv_audio_pwm.c') |
              ForEach-Object { Join-Path $Bsp $_ } |
              Where-Object { Test-Path $_ }
+
+# ⑥ SEGGER RTT：**SEGGER 官方源码，一个字没改**（bsp/segger_rtt/，见那里的 README）
+#    为什么值得单独列出来：它是控制台之外的第二条打印通道，走调试器读内存，
+#    不受 USB-Serial/JTAG "主机不再收"那个哑巴状态影响（那个坑让本工程白烧过好几轮）。
+#    bsp/drv_rtt.c 只做三件事：把控制台输出镜像过去、把 RTT 输入注入 shell、
+#    给一条 `rtt` 状态命令。配置在 bsp/segger_rtt/SEGGER_RTT_Conf.h。
+$otherSrc += @(
+    (Join-Path $Bsp 'segger_rtt\SEGGER_RTT.c'),
+    (Join-Path $Bsp 'segger_rtt\SEGGER_RTT_printf.c')
+)
+
+# ⑦ CherryUSB：**RT-Thread 源码树里自带的那份**（components/drivers/usb/cherryusb/），
+#    一个字节没改。编哪几个文件 = 官方 SConscript 里 RT_CHERRYUSB_DEVICE +
+#    RT_CHERRYUSB_DEVICE_DWC2_CUSTOM + RT_CHERRYUSB_DEVICE_MSC +
+#    RT_CHERRYUSB_DEVICE_TEMPLATE_MSC_BLKDEV 那几支选择的结果：
+#      core/usbd_core.c            设备协议栈
+#      osal/usb_osal_rtthread.c    OSAL（线程/信号量，RT-Thread 版）
+#      port/dwc2/usb_dc_dwc2.c     DWC2 控制器驱动（ip 核，与厂商无关）
+#      class/msc/usbd_msc.c        MSC（U 盘）类
+#      demo/msc_ram_template.c     官方 demo；开了 *_MSC_BLKDEV 就走"盘 = RT-Thread
+#                                  块设备"那条分支（设备名见 bsp/usb_config.h）
+#    ⚠️ DWC2 的**厂商胶水**（PHY/时钟/中断）官方只提供了 st/gd/nation/hc/kendryte/esp，
+#       没有 S31 —— 那部分由本工程的 bsp/drv_usb_msc.c 提供（选 DWC2_CUSTOM 这一支）。
+$Cherry = Join-Path $Rtt 'components\drivers\usb\cherryusb'
+$otherSrc += @(
+    (Join-Path $Cherry 'core\usbd_core.c'),
+    (Join-Path $Cherry 'osal\usb_osal_rtthread.c'),
+    (Join-Path $Cherry 'port\dwc2\usb_dc_dwc2.c'),
+    (Join-Path $Cherry 'class\msc\usbd_msc.c'),
+    (Join-Path $Cherry 'demo\msc_ram_template.c')
+)
 $otherSrc += @('s31_psram.c') |
              ForEach-Object { Join-Path $Bsp $_ } |
              Where-Object { Test-Path $_ }
 $otherSrc += (Join-Path $App 'main.c')
+# 应用层：写一个就自动参与编译
+$otherSrc += @('wav_player.c') |
+             ForEach-Object { Join-Path $App $_ } |
+             Where-Object { Test-Path $_ }
 
 $inc = @(
     "-I$Bsp",
@@ -157,12 +219,40 @@ $inc = @(
     # 所以官方那份 inc 目录必须进搜索路径；dev_spi_flash.h 在同级目录。
     "-I$Rtt\components\drivers\spi\sfud\inc",
     "-I$Rtt\components\drivers\spi",
+    # DFS + elmfat（官方组件）：dfs.h 那套在 dfs_v1/include，
+    # ff.h/ffconf.h/diskio.h 在 elmfat 目录里（dfs_elm.c 用尖括号 include 它们）
+    "-I$Rtt\components\dfs\dfs_v1\include",
+    "-I$Rtt\components\dfs\dfs_v1\filesystems\elmfat",
+    # RT-Thread 自己那套 POSIX 头（components/libc/compilers/{common,newlib}）——
+    # 位置和 RTT 官方构建系统一致（全局生效）。为什么必须加：
+    #   · dfs.h 要的 `<sys/statfs.h>` **newlib 根本没有**；
+    #   · `<dirent.h>` 必须命中 RTT 那份：它认 `HAVE_DIR_STRUCTURE`
+    #     （dfs_elm.c:27 定义），于是**不再定义 DIR**；newlib 的 sys/dirent.h
+    #     会把 DIR 再定义一遍 → `conflicting types for 'DIR'`（本工程踩过）；
+    #   · 而 msh.c/shell.c 也会间接 include dfs.h（命令行的 cd/pwd），
+    #     所以没法只给"DFS 那几个文件"加 —— 只能全局加，跟 RTT 一样。
+    "-I$Rtt\components\libc\compilers\common\include",
+    "-I$Rtt\components\libc\compilers\newlib",
+    # SEGGER RTT（官方源码 + 我们的配置头）
+    "-I$Bsp\segger_rtt",
+    # CherryUSB（官方组件）：usb_config.h 是它约定要 BSP 提供的配置入口，
+    # 由 usbd_core.h 直接 `#include "usb_config.h"` —— 本工程那份在 bsp/usb_config.h
+    # （`-I$Bsp` 已在最前面，所以能命中）。下面这些是官方 SConscript 里的 CPPPATH。
+    "-I$Cherry",
+    "-I$Cherry\common",
+    "-I$Cherry\core",
+    "-I$Cherry\class\msc",
+    "-I$Cherry\osal",
+    "-I$Cherry\port\dwc2",
     # ★ 冻结的 IDF 头（bsp/s31_psram.c 里的 LL 头靠它编过）——
     #   放最后，工程自己的同名头优先
     "-I$Bsp\idf_headers",
     "-I$Rtt\include",
     "-I$Rtt\components\finsh",
     "-I$Rtt\components\drivers\include",
+    # audio 框架：dev_audio.h（在 drivers/include 里）会 include "dev_audio_pipe.h"，
+    # 而那个头在 components/drivers/audio/ 下（官方 SConscript 也是这么加路径的）
+    "-I$Rtt\components\drivers\audio",
     "-I$Rtt\libcpu\risc-v\common"
 )
 
@@ -174,8 +264,45 @@ $Common = @(
     '-ffunction-sections', '-fdata-sections',
     '-Wall', '-Wno-unused-parameter', '-Wno-unused-variable',
     '-Wno-unused-but-set-variable', '-Wno-missing-prototypes',
-    '-D__RTTHREAD__'
+    '-D__RTTHREAD__',
+    # 🚨 与上面那两个 RTT POSIX 头**成对出现**，少一个就编不过：
+    #    RTT 的 sys/{select,time,signal}.h 会盖住 newlib 的同名头，而它们假定
+    #    POSIX.1-1990 可见性（RTT 构建系统里这个宏是全局的，见
+    #    components/libc/compilers/newlib/SConscript 的 CPPDEFINES）。
+    #    少了它，newlib 的 sys/types.h 会去包含 RTT 的 sys/select.h、再半路掉进
+    #    newlib 的 time.h，报一堆 `unknown type name 'clock_t'/'clockid_t'/'pid_t'`。
+    #    对 ISO C 的可见性无影响（那是 __STRICT_ANSI__ 管的）。
+    '-D_POSIX_C_SOURCE=1'
 ) + $inc
+
+# ---- DFS 这批文件（列表 + 说明；编译参数已并进全局 $Common）------------------
+# 见 $inc 里 RTT POSIX 头那段注释：那些头是全局加的，所以这里只列文件，
+# 单独列出来是为了"删/加 DFS 时一眼看到编了哪几个 .c"。
+$dfsSrc = @(
+    (Join-Path $Rtt 'components\dfs\dfs_v1\src\dfs.c'),
+    (Join-Path $Rtt 'components\dfs\dfs_v1\src\dfs_file.c'),
+    (Join-Path $Rtt 'components\dfs\dfs_v1\src\dfs_fs.c'),
+    (Join-Path $Rtt 'components\dfs\dfs_v1\src\dfs_posix.c'),
+    (Join-Path $Rtt 'components\dfs\dfs_v1\filesystems\elmfat\ff.c'),
+    (Join-Path $Rtt 'components\dfs\dfs_v1\filesystems\elmfat\ffunicode.c'),
+    (Join-Path $Rtt 'components\dfs\dfs_v1\filesystems\elmfat\dfs_elm.c'),
+    (Join-Path $Rtt 'components\dfs\dfs_v1\filesystems\devfs\devfs.c'),
+    (Join-Path $Rtt 'components\finsh\msh_file.c')
+)
+$otherSrc = $otherSrc | Where-Object { $dfsSrc -notcontains $_ }
+
+# ---- 设备 IPC（components/drivers/ipc/）----------------------------------------
+# audio 框架的 replay 队列用 rt_data_queue + rt_completion，音频管道用 rt_ringbuffer ——
+# 这三样都在这个目录里，而且要带 `__RT_IPC_SOURCE__`（官方 SConscript 的 LOCAL_CPPDEFINES）。
+# 非 SMP → 用 completion_up.c（completion_mp.c 是给 SMP 的）。
+$ipcSrc = @(
+    (Join-Path $Rtt 'components\drivers\ipc\dataqueue.c'),
+    (Join-Path $Rtt 'components\drivers\ipc\completion_comm.c'),
+    (Join-Path $Rtt 'components\drivers\ipc\completion_up.c'),
+    (Join-Path $Rtt 'components\drivers\ipc\ringbuffer.c')
+)
+$ipcExtra = @('-D__RT_IPC_SOURCE__')
+$otherSrc = $otherSrc | Where-Object { $ipcSrc -notcontains $_ }
 
 # -Safe：退回 POR 的 XTAL 40MHz（完全不动时钟树），用于"320MHz 起不来"时救砖
 if ($Safe) {
@@ -224,6 +351,8 @@ Push-Location $Build
 try {
     foreach ($f in $kernelSrc) { Compile-One $f @('-D__RT_KERNEL_SOURCE__') }
     foreach ($f in $otherSrc)  { Compile-One $f @() }
+    foreach ($f in $dfsSrc)    { Compile-One $f @() }
+    foreach ($f in $ipcSrc)    { Compile-One $f $ipcExtra }
     if ($failed) { exit 1 }
 
     # ---- 链接 --------------------------------------------------------------
@@ -231,8 +360,9 @@ try {
     # trap_entry 会引用未定义的 handle_trap，靠它掉掉；FSymTab/.text.entry
     # 在 linker.ld 里是 KEEP，不会被误删）
     # SW_handler 必须 64 字节对齐（CLIC 的 mtvec[31:6]），linker.ld 有 ASSERT 兜底
+    # -lm：bsp/drv_audio_pwm.c 的 tone 用 sinf 生成测试正弦（工具链自带 libm.a）
     & $Gcc @Common "-Wl,-Map=$Build\app.map" '-Wl,--no-warn-rwx-segments' '-Wl,--gc-sections' `
-        '-T' (Join-Path $Bsp 'linker.ld') '-o' (Join-Path $Build 'app.elf') @objs
+        '-T' (Join-Path $Bsp 'linker.ld') '-o' (Join-Path $Build 'app.elf') @objs '-lm'
     if ($LASTEXITCODE -ne 0) { Write-Host 'LINK FAILED' -ForegroundColor Red; exit 1 }
     Write-Host '=== built app.elf ==='
     & $Size app.elf
