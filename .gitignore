@@ -2,7 +2,9 @@
 rt-thread/
 rt-thread.commit
 
-# 构建产物
+# 构建产物（tools/build.ps1 的输出目录是 build/：obj/ + app.elf/app.bin/app.map。
+# m0/ 是早期用过的输出目录名，留着兼容，别再往那儿写。）
+build/
 m0/app.elf
 m0/app.bin
 **/*.o
