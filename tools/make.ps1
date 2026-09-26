@@ -31,8 +31,12 @@ $PS    = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File')
 
 # ---- 端口：命令行 > local.env.ps1 > 环境变量 > COM43 ----------------------
 if ($Port -eq '') {
-    $WsLocalEnv = Join-Path (Split-Path -Parent (Split-Path -Parent $Root)) 'local.env.ps1'
-    if (Test-Path $WsLocalEnv) { . $WsLocalEnv }
+    # local.env.ps1 在工程目录的**上两级**（工作区根）。独立仓库（GitHub 那份）里
+    # 工程根就是仓库根，再往上不存在 → Split-Path 返回空串，Join-Path/Test-Path
+    # 拿到空串会抛异常，所以必须先判空（详见 build.ps1 里同一处的说明）。
+    $WsRoot = Split-Path -Parent (Split-Path -Parent $Root)
+    $WsLocalEnv = if ($WsRoot) { Join-Path $WsRoot 'local.env.ps1' } else { '' }
+    if ($WsLocalEnv -and (Test-Path $WsLocalEnv)) { . $WsLocalEnv }
     $Port = if ($env:ESP32_S31_PORT) { $env:ESP32_S31_PORT } else { 'COM43' }
 }
 

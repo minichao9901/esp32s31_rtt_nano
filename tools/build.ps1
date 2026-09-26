@@ -34,7 +34,21 @@ $Bsp   = Join-Path $Root 'bsp'
 $App   = Join-Path $Root 'app'
 $Build = Join-Path $Root 'build'
 $ObjDir = Join-Path $Build 'obj'
-$WsLocalEnv = Join-Path (Split-Path -Parent (Split-Path -Parent $Root)) 'local.env.ps1'
+# ⚠️ local.env.ps1 在**工作区根**（= 工程目录的上两级）。独立仓库（GitHub 上那份）
+#    里工程根就是仓库根，再往上两级不存在 → `Split-Path -Parent` 返回空串，
+#    `Join-Path ''` 在 $ErrorActionPreference='Stop' 下**直接把脚本打死**：
+#      Join-Path: build.ps1:37 无法将自变量绑定到参数 'Path'，因为它是空字符串。
+#    （2026-09-26 从公开仓库 clone 出来实测踩到：fetch_rtt.ps1 修好了、build 却一行没编就退出。）
+# 函数必须定义在调用之前（PowerShell 自上而下执行）。
+function Get-WsLocalEnv {
+    $wsRoot = Split-Path -Parent (Split-Path -Parent $Root)
+    if ($wsRoot) {
+        $p = Join-Path $wsRoot 'local.env.ps1'
+        if (Test-Path $p) { return $p }
+    }
+    return ''      # 独立仓库：没有工作区，端口走环境变量 / 默认值
+}
+$WsLocalEnv = Get-WsLocalEnv
 
 if (-not (Test-Path (Join-Path $Rtt 'src'))) {
     Write-Host "RT-Thread 源码不在 $Rtt，先跑：pwsh -File tools\fetch_rtt.ps1" -ForegroundColor Red
@@ -58,7 +72,7 @@ $PyExe = Get-ChildItem (Join-Path $env:USERPROFILE '.espressif\python_env') -Dir
 if (-not $PyExe) { $PyExe = 'python' }
 
 if ($Port -eq '') {
-    if (Test-Path $WsLocalEnv) { . $WsLocalEnv }
+    if ($WsLocalEnv -and (Test-Path $WsLocalEnv)) { . $WsLocalEnv }
     $Port = if ($env:ESP32_S31_PORT) { $env:ESP32_S31_PORT } else { 'COM43' }
 }
 
