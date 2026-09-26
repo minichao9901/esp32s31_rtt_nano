@@ -106,17 +106,9 @@ pwsh -File tools\reset_probe.py COM43 5          # 板子不理人时手动拉 E
 | `psram_speed [KB]` | **PSRAM 读写带宽**（内部 RAM 做对照；见 §5.10 的数字与三个测速坑）|
 | `reboot` | 整片复位（走 RTC 看门狗；见 §5.9 的说明 —— **别用 core0 软复位**） |
 | `lcd [demo\|fill <色>\|clk <hz>]` | 外接 SPI 屏（AXS15352 240×296）：`lcd demo` = 8 色 × 2 轮刷屏，`lcd fill r\|g\|b\|black\|white\|rg\|gb\|rb` 单色，`lcd clk 10000000` 降时钟（花屏时用） |
-| `sf probe [dev] [hz]` | **SFUD 识别外接 SPI flash**（默认 `flash0` / 20 MHz；见 §5.11） |
-| `sf info` | 型号/容量/写粒度/擦除粒度 + **SFDP 解析结果** + 状态寄存器逐位解释 |
-| `sf dbg [hz]` | **裸事务诊断**：0x9F/0x90/0x5A/0x05/0x03 的原始字节 + SPI2 寄存器快照 |
-| `sf bb` | **软件位翻转读 0x9F（绕开 SPI 外设）** 连读 5 次 —— 判"模块/接线"还是"驱动" |
-| `sf clk [hz]` | 看/换 SPI 时钟（换完自动重识别，通不过会退回默认档） |
-| `sf read <addr> [len]` | 读 + 十六进制 dump（默认 64 B，单次最多 4 KB） |
-| `sf write <addr> <hex>` | **先擦后写**；hex 写 `"DEADBEEF"`（一条最多 32 B）或空格分开的 `AA BB CC` |
-| `sf erase <addr> <len>` | 擦除（按 4 KB 扇区向上对齐，打印实际覆盖范围） |
-| `sf status [vol] [val]` | 读状态寄存器（WIP/WEL/BP/SRP 逐位解释）/ 写 |
-| `sf test <addr> [len]` | **完整自检**：备份→擦→验全 FF→写花样（含跨页）→逐字节读回校验→还原 |
-| `sf bench <addr> <len>` | 速度基准：擦/写/读 + **4 档块长对照**（判断要不要上 DMA 用） |
+| `sf probe <spi_dev>` | **官方 SFUD 命令**：识别外接 flash（如 `sf probe flash0`；⚠️ 每次复位后要重敲） |
+| `sf read/erase/write/status` | 官方 `sf` 的读写擦（`sf read <addr> <size>`、`sf erase <addr> <size>`、`sf write <addr> <b0> <b1>…`） |
+| `list device` | 看设备框架里的设备 —— 外接 flash 是块设备 **`spi_flash0`**（2048×4KB，留给 DFS 用） |
 
 ---
 
@@ -500,69 +492,51 @@ make msh MSH="psram_speed 256"          # 就是上面那张表
 
 ---
 
-### 5.11 SFUD：外接 SPI flash（`bsp/sfud/`，2026-09-25）
+### 5.11 SFUD：外接 SPI flash（**走 RT-Thread 官方组件** + 块设备）
 
-把 [armink/SFUD](https://github.com/armink/SFUD)（MIT）接到 `drv_spi.c` 的 `spi2` 总线上。
-上游源码就在 `rt-thread/components/drivers/spi/sfud/`，**原样 vendor** 到 `bsp/sfud/`（5 个文件，
-SHA256 与上游一致），本工程只写配置头 + 移植层 + 命令层：
+外接 flash 走的是 **RT-Thread 官方那套**，本工程**一行移植代码都没写**：
 
-| 位置 | 内容 | 动没动上游 |
+| 谁 | 在哪 | 干什么 |
 |---|---|---|
-| `bsp/sfud/inc/` + `src/` | SFUD 引擎（`sfud.c` / `sfud_sfdp.c` + 4 个头） | **一个字没改**（校验哈希可证） |
-| `bsp/sfud/inc/sfud_cfg.h` | **本工程写的**配置：开 SFDP + 型号表、日志接 `rt_kprintf`、静态设备表 1 个 | 替换上游那份（上游绑 Kconfig/rtdbg） |
-| `bsp/sfud/port/sfud_port.c` | 移植层：`wr/lock/unlock` 钩子 + `sfud_spi_port_init()` + `s31_sfud_probe()` | 新写 |
-| `bsp/sfud/port/sfud_cmd.c` | `sf` 系列 msh 命令 | 新写 |
+| SFUD 引擎 | `rt-thread/components/drivers/spi/sfud/{inc,src}` | 上游原样（rt-thread 源码树自带） |
+| **官方移植层 + `sf` 命令 + 块设备注册** | `rt-thread/components/drivers/spi/dev_spi_flash_sfud.c` | 官方自带，**一个字没改** |
+| 本工程唯一的一层胶水 | `bsp/drv_spi_flash.c`（~50 行） | 调一次 `rt_sfud_flash_probe()` |
+| 开关 | `bsp/rtconfig.h` | `RT_USING_SFUD` / `RT_SFUD_USING_SFDP` / `RT_SFUD_USING_FLASH_INFO_TABLE` / `RT_SFUD_SPI_MAX_HZ` |
+| 构建 | `tools/build.ps1` | 直接把上面两个官方源文件加进源码表（**不拷进 bsp/**） |
 
-- **接的是 `flash0`**（`drv_spi.c` 挂在 `spi2` 上的设备），默认 20 MHz、mode0、8 位。
-  接线就是那套：**SCK=43(J2-17) MOSI=44(J2-18) MISO=45(J2-15) CS=46(J2-16)** + 3V3/GND。
-- 实测芯片：**Winbond W25Q64CV，8 MB，4 KB 扇区（擦除命令 0x20），SFDP rev 1.5**。
-  换别的 SPI NOR（GD25Qxx / MX25xx…）不用改代码 —— 先 SFDP 自动解析，解析不了再查内置型号表。
-- 🚨 **移植层的 `wr()` 必须自己切块**：`drv_spi.c` 是 PIO 通路，**一次最多 64 字节**，
-  超了驱动返回 0（不报错、不崩，就是"这次传输什么都没发生"）。命令+地址（≤8 B）与数据
-  （≤64 B）分开发，中间靠软件 CS 一直压着 —— 对 flash 来说仍是一次连续片选。
-- ⚠️ **`sfud_spi_port_init()` 这个名字改不了**（`sfud.c:252` 写死成 extern 调用），
-  所以**绝不能**把 RT-Thread 官方的 `components/drivers/spi/dev_spi_flash_sfud.c` 加进编译：
-  那份也定义同名函数、还有同名的 `sf` 命令，会直接撞车。`build.ps1` 只 glob `bsp\sfud\{src,port}`。
-- ⚠️ **设备本体用 SFUD 自己那张静态表**（`sfud_get_device(0)` 拿到的那份）。
-  第一版自己又定义了一份 `sfud_flash` 去初始化，结果"probe 成功、`get_device(0)->init_ok` 永远是 0"
-  —— 初始化的和取回的是两个对象。
-- `build.ps1` 里把 `sfud_cfg.h` / `sfud_port.h` 加进了**全局头依赖表**（改了会全量重编），
-  `bsp/sfud/{src,port}/*.c` 自动参与编译（跟 bsp 下别的驱动一个规矩）。
-- ⚠️ **`sf` 命令的地址参数一律必填**：没有"不带参数就整片擦"的路径 —— 上游那个 `sf bench`
-  是整片擦，这块板子的外接 flash 未必是空的，不能默认抹掉。`sf test` / `sf bench` 也只动你给的那段。
-- 📊 **实测（W25Q64CV @20 MHz，PIO 一次 64 字节）**：
+```c
+/* bsp/drv_spi_flash.c 的全部实质内容 */
+rt_spi_flash_device_t dev = rt_sfud_flash_probe("spi_flash0", "flash0");
+INIT_COMPONENT_EXPORT(s31_spi_flash_init);   /* 组件级：保证跑在设备级 drv_spi 之后 */
+```
 
-  | 项目 | 实测 | 说明 |
-  |---|---|---|
-  | 擦 4 KB | **39\~47 ms** | W25Q64 的 tSE 典型值就是 45 ms（不是慢，是这芯片就这样）|
-  | 写（按 256 B 页） | **0.4 MB/s** | 大头是每页 0.7 ms 的 tPP，不是总线 |
-  | 读 | **1.6 MB/s** | 20 MHz 线速的 **64%**；参考工程用 IDF 的 **DMA** 单事务读 4 KB 是 2468 kB/s（98.7%）⇒ **差距全在 PIO 每 64 字节重配一次** |
-  | `sf test` 自检 | **PASS**（4096/4096 字节一致 + 还原成功）| 擦→验全 FF→写花样（含跨页）→逐字节读回→还原原数据 |
+- 接线：**SCK=GPIO43(J2-17) MOSI=44(J2-18) MISO=45(J2-15) CS=46(J2-16)** + 3V3/GND
+  （即 `drv_spi.c` 默认那套；`flash0` 就是挂在 `spi2` 上的 SPI 设备）
+- 实测：`[I/SFUD] Found a Winbond flash chip. Size is 8388608 bytes.`
+  → **块设备 `spi_flash0`：2048 扇区 × 4096 字节 = 8192 KB**，`list device` 里能看到
+  （**留着块设备就是为了以后挂 DFS**；扇区 = 擦除粒度 4KB）
+- 命令是官方 `sf`：`sf probe flash0` / `sf read <addr> <size>` / `sf erase <addr> <size>` /
+  `sf write <addr> <b0> <b1> ...` / `sf status`
+  - ⚠️ **`sf probe flash0` 每次复位后都要敲一次**：官方把选中的设备放在 static 变量里，不跨复位保留
+  - ⚠️ 官方 `sf bench` 是**整片擦**（提示要打 `sf bench yes` 才动）—— 外接 flash 里可能有你的东西，慎用
+  - ⚠️ `sf probe` 用的是官方自己注册的第二个块设备 `sf_cmd`，与本工程开机注册的 `spi_flash0`
+    是两个 `sfud_flash` 实例（都指向同一条 SPI 设备，单独用没问题）
+- ⚠️ **`RT_USING_DEBUG` 必须开**：SFUD 的 `SFUD_INFO` 就是 rtdbg 的 `LOG_I`，
+  没开的话 `LOG_*` 全是空宏 —— "识别到什么芯片 / 找不到芯片"这些信息会**一声不响地消失**（踩过）。
+  开了之后 SFUD 按 `DBG_LVL=DBG_INFO` 输出，就是上面那些 `[I/SFUD]` 行。
+- ⚠️ **`RT_SFUD_SPI_MAX_HZ` 官方默认 50000000**，会被分频成 **40MHz**；本板这套杜邦线只验过
+  20MHz（`spi_flash_sfud` 工程实测 20MHz 下 98.7% 线速），所以先定在 20MHz。
+- 🚀 **任意长度由 `drv_spi.c` 的 DMA 撑着**：官方移植层**自己不切块**（页编程一次给 4+256 字节、
+  读给整段），>64 字节全交给 `drv_spi.c` 的 AXI PDMA 通路（见 §5.6）—— 所以这套能跑起来的前提是
+  驱动支持任意长度。实测 `sf read 0 256` 走的就是 DMA。
+- 📊 实测：`sf erase` 4KB 约 **47 ms**（W25Q64 的 tSE 典型值就是 45 ms）、
+  读 **1.95 MB/s**（20 MHz 线速的 78%，PIO 天花板是 1.68）。
 
-  `sf bench` 的"SPI 事务尺寸对照"是把移植层的切块大小从 64 往下调着量（**真的在改事务尺寸**）：
-  8 B → 0.7、16 B → 1.1、32 B → 1.4、64 B → 1.6 MB/s。往上就到头了（PIO 只有 16 字 FIFO）。
-- 🚨 **移植层自己踩的三个坑**（都不在 SFUD 里）：
-  1. **切块读必须每块递增地址** —— 一开始只是把同一段"0x03 + 地址 0"重复发 N 次，
-     现象是"第一块对、从 +64 起全不对，读回的值正好是缓冲区开头的内容"。
-     ⚠️ 但只有**普通读 0x03** 能这么算地址：`0x9F` 没有地址、`0x5A`(SFDP) 和 `0x0B` 最后还有个空转字节，
-     好在它们一次最多读 36 字节、一块就够。
-  2. **页编程是一条 4 + 256 字节的长写**（`sfud.c:664` 一次给 260 字节），
-     必须拆成"命令+地址"+"分块数据"的 **message 链**（`cs_take` 只在第一段、`cs_release` 只在最后一段）；
-     用 `rt_spi_transfer()` 会把 `cs_take/cs_release` 都置 1，等于第一段发完就抬 CS。
-     ⚠️ 链的越界检查要写在**用之前**，写在 `n++` 之后的话最后一块正好顶到上限、被误判成"链太长"。
-  3. **`-RT_EBUSY` 不是错误**：`rt_spi_bus_configure()` 在"总线被别的设备占着"时就返回它
-     （源码注释原文：*not an error condition and the configuration will take effect once the
-     device has the bus*），把它当失败会让 probe 在跑过别的 SPI 设备之后直接报 rc=-7。
-  4. 调试开关要用 `#if` 而不是 `#ifdef` —— 宏定义成 `0` 也算"已定义"，`#ifdef` 关不掉（日志里一直冒 `[sfud-x]`）。
-
-> 🚨 **这一节最值钱的不是 SFUD，是它逼出来的那个 SPI 片选 bug** —— 见 §5.6 里那条
-> "CS 必须是软件驱动的普通 GPIO"。当时的现象是"**只有第一条事务能通**"，
-> 把 SFUD、RT-Thread 的 SPI 框架、事务写法全怀疑了一遍，最后靠三条证据定位：
-> `sf bb`（软件位翻转 5/5 全对）证明硬件没问题、`spi_loop` 连跑 3 次证明通路没问题、
-> 寄存器对账证明配置没被改坏 ⇒ 剩下的只有"CS 在事务之间没有高电平"。
-> **`sf bb` 这条命令留着**：以后任何"某条 SPI 器件读不出来"的场合，它都能一刀切开
-> "模块/接线"和"驱动"两边。
-
+> 🚨 **这一节最值钱的不是 SFUD，是它逼出来的那些坑** —— 见 §5.6 的"CS 必须是软件 GPIO"
+> 与 §6 第 23/25 条（片选丢命令边界、切时钟把 USB 块带掉导致控制台哑）。
+> 早期版本曾自写移植层 + 自写 `sf` 命令（多了 `sf dbg`/`sf bb` 等排错命令），
+> 2026-09-25 按"走官方"的要求切回官方组件；那套诊断代码留在 git 里
+> （提交 `0d39e26`，`bsp/sfud/port/`），需要时可以从历史里取回。
 ---
 
 ## 6. 踩过的坑（现象 → 根因 → 修法）

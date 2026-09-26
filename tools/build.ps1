@@ -128,19 +128,24 @@ $otherSrc += @(
     (Join-Path $Rtt 'components\drivers\i2c\dev_i2c_dev.c')
 )
 
+# ④ SFUD：**RT-Thread 官方那套**，直接从 rt-thread 源码树编，不拷进 bsp/、不改一个字
+#    - sfud/src/sfud*.c          SFUD 引擎本体
+#    - dev_spi_flash_sfud.c      官方移植层（wr/lock/unlock 钩子）+ `sf` 命令 + **块设备注册**
+#    bsp/drv_spi_flash.c 里调一次 rt_sfud_flash_probe() 就带起来；开关在 bsp/rtconfig.h。
+$otherSrc += @(
+    (Join-Path $Rtt 'components\drivers\spi\sfud\src\sfud.c'),
+    (Join-Path $Rtt 'components\drivers\spi\sfud\src\sfud_sfdp.c'),
+    (Join-Path $Rtt 'components\drivers\spi\dev_spi_flash_sfud.c')
+)
+
 $otherSrc += @('startup.S', 'trap_gcc.S', 'board.c', 'drv_usj.c', 'drv_usj_dev.c',
                'drv_systick.c', 'drv_clk.c', 'trap_handler.c', 'syscalls_stub.c') |
              ForEach-Object { Join-Path $Bsp $_ }
 # 外设驱动：写好一个就自动参与编译（还在写的时候就跳过）
-$otherSrc += @('drv_gpio.c', 'drv_spi.c', 'drv_i2c.c', 'drv_lcd_axs15352.c') |
+$otherSrc += @('drv_gpio.c', 'drv_spi.c', 'drv_i2c.c', 'drv_lcd_axs15352.c',
+               'drv_spi_flash.c') |
              ForEach-Object { Join-Path $Bsp $_ } |
              Where-Object { Test-Path $_ }
-# SFUD（bsp/sfud/：inc + src 是**原样 vendor 的上游**，port 是本工程写的胶水）
-#   新增文件放这两个目录里就自动参与编译（同上面"写好一个就自动参与"的规矩）。
-#   ⚠️ 别把 rt-thread\components\drivers\spi\dev_spi_flash_sfud.c 加进来：
-#      那个官方移植层会抢 `sfud_spi_port_init` 和 `sf` 命令（和本 port 重复）。
-$otherSrc += Get-ChildItem (Join-Path $Bsp 'sfud\src'), (Join-Path $Bsp 'sfud\port') -Filter *.c |
-             Select-Object -ExpandProperty FullName
 $otherSrc += @('s31_psram.c') |
              ForEach-Object { Join-Path $Bsp $_ } |
              Where-Object { Test-Path $_ }
@@ -148,9 +153,10 @@ $otherSrc += (Join-Path $App 'main.c')
 
 $inc = @(
     "-I$Bsp",
-    # SFUD：sfud_def.h 里是 `#include <sfud_cfg.h>`（尖括号），所以 inc 目录必须进搜索路径
-    "-I$Bsp\sfud\inc",
-    "-I$Bsp\sfud\port",
+    # SFUD（官方组件）：sfud_def.h 里是 `#include <sfud_cfg.h>`（尖括号），
+    # 所以官方那份 inc 目录必须进搜索路径；dev_spi_flash.h 在同级目录。
+    "-I$Rtt\components\drivers\spi\sfud\inc",
+    "-I$Rtt\components\drivers\spi",
     # ★ 冻结的 IDF 头（bsp/s31_psram.c 里的 LL 头靠它编过）——
     #   放最后，工程自己的同名头优先
     "-I$Bsp\idf_headers",
@@ -188,10 +194,9 @@ $failed = $false
 $GlobalHeaders = @(
     (Join-Path $Bsp 'rtconfig.h'),
     (Join-Path $Bsp 's31_regs.h'),
-    # SFUD 的配置头：改了它（开关功能/换设备表）必须全量重编，
+    # SFUD 的配置头（官方那份）：改了它（开/关 SFDP、型号表）必须全量重编，
     # 否则会拿旧配置的 .o 去链，症状是"明明打开了某个功能却没生效"（踩过）
-    (Join-Path $Bsp 'sfud\inc\sfud_cfg.h'),
-    (Join-Path $Bsp 'sfud\port\sfud_port.h')
+    (Join-Path $Rtt 'components\drivers\spi\sfud\inc\sfud_cfg.h')
 )
 $NewestHeader = ($GlobalHeaders | Where-Object { Test-Path $_ } |
                  ForEach-Object { (Get-Item $_).LastWriteTime } |

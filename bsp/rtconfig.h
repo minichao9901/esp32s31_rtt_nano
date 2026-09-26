@@ -53,6 +53,27 @@
 #define RT_USING_QSPI
 #define RT_USING_I2C
 
+/* ---- SFUD：走 RT-Thread **官方组件**（2026-09-25 从自写移植层切回来）----
+ * 官方那套在 rt-thread 源码树里自带，本工程一行都不用写：
+ *   components/drivers/spi/sfud/{inc,src}       SFUD 引擎本体
+ *   components/drivers/spi/dev_spi_flash_sfud.c 官方移植层 + `sf` 命令 + **注册块设备**
+ * 由 tools/build.ps1 直接编（不拷进 bsp/），bsp/drv_spi_flash.c 里调一次
+ * `rt_sfud_flash_probe()` 就带起来了 —— 正是"注册一个 SPI 设备就有 SFUD"的官方姿势。
+ * 块设备留着是为了以后挂 DFS（`spi_flash0`，扇区 = 擦除粒度 4KB）。
+ * RT_SFUD_USING_SFDP：先走 JEDEC SFDP 自动解析；解析不了再查内置型号表。 */
+#define RT_USING_SFUD
+#define RT_SFUD_USING_SFDP
+#define RT_SFUD_USING_FLASH_INFO_TABLE
+/* SFUD 给 flash 用的 SPI 时钟上限。官方默认 50000000，会被分频成 40MHz ——
+ * 本板这套杜邦线只验过 20MHz（工作区 spi_flash_sfud 工程实测 20MHz 下 98.7% 线速），
+ * 所以先按 20MHz 定住；想试更快改这个数即可。*/
+#define RT_SFUD_SPI_MAX_HZ          20000000
+
+/* 打开调试日志：**SFUD 的 SFUD_INFO 就是 rtdbg 的 LOG_I**，而没开 RT_USING_DEBUG 时
+ * rtdbg 的 LOG_* 全是空宏 —— 那样"识别到 Winbond 8MB"、"找不到芯片"这些信息
+ * 会一声不响地消失（本工程踩过）。开了之后 SFUD 按 DBG_LVL=DBG_INFO 输出。*/
+#define RT_USING_DEBUG
+
 #define RT_VER_NUM                  0x50202     /* v5.2.2 */
 #define RT_BACKTRACE_LEVEL_MAX_NR   32          /* kservice.c:422 用到（无 guard） */
 
