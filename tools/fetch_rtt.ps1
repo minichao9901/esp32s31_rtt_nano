@@ -9,11 +9,18 @@
 #
 # 为什么用稀疏检出：rt-thread 全仓库带几百个 BSP，几百 MB；我们只要
 #   src/ include/ libcpu/(riscv) components/finsh/ components/drivers/
-#   —— 内核 + msh + 设备框架（pin/spi/i2c）足矣。
-# ⚠️ 这份清单要和 tools/build.ps1 的源码表对得上：那边用了
-#   components/drivers/{core,pin,spi,i2c} 里的 6 个 .c，所以 drivers 必须整目录拿。
-#   （2026-09-25 踩过：清单漏了 drivers，新 clone 下来编到 rtdevice.h 就断，
-#     而本机因为早期手工补过目录所以一直没暴露。）
+#   components/dfs/ components/libc/
+#   —— 内核 + msh + 设备框架（pin/spi/i2c）+ SFUD + DFS/elmfat 足矣。
+# ⚠️ 这份清单**必须**和 tools/build.ps1 的源码表 / 包含路径对得上：
+#   · components/drivers/{core,pin,spi,i2c} 的 6 个 .c + drivers/spi/sfud 引擎
+#     + drivers/audio/dev_audio*.c + drivers/usb/cherryusb ⇒ **drivers 整目录拿**；
+#   · components/dfs/dfs_v1/{src,filesystems/{elmfat,devfs}} 共 8 个 .c
+#     （DFS + 官方 elmfat + devfs，2026-09-26 起编）⇒ dfs 必须拿；
+#   · build.ps1 还 `-I` 到 components/libc/compilers/{common,newlib}
+#     （dfs.h 要的 <sys/statfs.h> newlib 里没有，得由 RT-Thread 那套补）⇒ libc 必须拿。
+#   （2026-09-25 踩过：清单漏了 drivers，新 clone 下来编到 rtdevice.h 就断；
+#     2026-09-26 又漏了 dfs/libc —— 本机因为早期手工 expand 过目录所以一直没暴露，
+#     从本仓库 clone 的人会一路编到 dfs_v1 才断，更难查。）
 #
 # ★ 版本可复现：`rt-thread.pin`（**进库**）里钉着"本工程验证过的 tag + commit"，
 #   默认就按它取 —— 否则明天上游发 v5.3 你 clone 下来编不过，都不知道该怪谁。
@@ -36,7 +43,9 @@ $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $Dest = Join-Path $Root 'rt-thread'
 $Pin  = Join-Path $Root 'rt-thread.pin'
-$Sparse = @('src', 'include', 'libcpu', 'components/finsh', 'components/drivers')
+$Sparse = @('src', 'include', 'libcpu',
+            'components/finsh', 'components/drivers',
+            'components/dfs', 'components/libc')
 
 # ---- 定版本：-Tag > rt-thread.pin > 最新 v5.x -----------------------------
 $PinTag = ''
