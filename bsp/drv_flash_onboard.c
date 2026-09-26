@@ -435,7 +435,8 @@ static void onboard(int argc, char **argv)
                (unsigned)S31_OB_DISK_ADDR, (unsigned)(S31_OB_DISK_ADDR + S31_OB_DISK_SIZE));
     rt_kprintf("  自检扇区   : 0x%06x（`onboard -t` 强制重跑一次擦/写/读自检）\n",
                (unsigned)S31_OB_SCRATCH_ADDR);
-    rt_kprintf("  用法       : mkfs onboard0 -> mount onboard0 /disk elm -> ls /disk -> df\n");
+    rt_kprintf("  用法       : mkfs onboard0 -> mount onboard0 / elm -> ls / -> df\n");
+    rt_kprintf("               ⚠️ 第一个文件系统要挂 \"/\"（DFS v1 没有虚拟根目录，见 README 坑 28）\n");
 }
 MSH_CMD_EXPORT(onboard, show/verify onboard flash disk (onboard [-t]));
 

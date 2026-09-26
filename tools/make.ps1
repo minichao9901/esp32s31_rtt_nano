@@ -76,6 +76,10 @@ switch ($Cmd) {
         Write-Host '  make run          flash 之后一直看串口（Ctrl+C 退出；SECONDS=8 只看 8 秒）'
         Write-Host '  make monitor      只看串口（SECONDS=8 看一段；缺省一直看）'
         Write-Host '  make msh          敲 msh 命令并收响应：make msh MSH="help|psram_info|free"'
+        Write-Host '  make rtt          **SEGGER RTT 控制台**（走 JTAG，不碰 USB-CDC）：'
+        Write-Host '                      make rtt MSH="mount onboard0 / elm|ls /" SECONDS=6'
+        Write-Host '  make wav          造测试 WAV 到 build\（WAV_ARGS="--rate 22050 --bits 16"）；'
+        Write-Host '                      DRIVE=D 顺手拷到 MSC 盘上'
         Write-Host '  make watch        不复位地观察串口（板子在跑、你不想打断它时用）'
         Write-Host '  make tail         容错观察：设备掉了自动重开 —— 看"是不是在反复复位"'
         Write-Host '  make reset        手动拉 EN 复位一次，然后听几秒（板子"不理人"时用）'
@@ -138,6 +142,31 @@ switch ($Cmd) {
     'msh' {
         # 敲命令：msh.py 会先等固件起来（开端口本身会复位芯片）
         Run-Py 'msh.py' @($Port, $Msh, "$(if ($Seconds -gt 0) { $Seconds } else { 6 })")
+    }
+
+    'rtt' {
+        # SEGGER RTT 控制台（走 JTAG，不碰 USB-CDC）：MSH= 要敲的命令，SECONDS= 听完多久
+        # 🚨 加 --reset：开 OpenOCD 不保证复位芯片，上一轮的挂载状态会留着
+        $a = @('--reset')
+        if ($Msh) { $a += $Msh }
+        $a += "$(if ($Seconds -gt 0) { $Seconds } else { 6 })"
+        Run-Py 'rtt.py' $a
+    }
+
+    'wav' {
+        # 造一个测试 WAV 到 build\（默认 16kHz/8bit/小星星）；
+        #   加参数：make wav WAV_ARGS="--rate 22050 --bits 16 --tune sweep"
+        #   顺手拷到 MSC 盘：make wav DRIVE=D   （板子上先 `msc start`）
+        $out = 'build\test.wav'
+        $a = @($out)
+        if ($env:WAV_ARGS) { $a += ($env:WAV_ARGS -split ' ') }
+        Run-Py 'make_test_wav.py' $a
+        if ($env:DRIVE) {
+            $dst = "{0}:\{1}" -f $env:DRIVE, (Split-Path $out -Leaf)
+            Copy-Item $out $dst -Force
+            Write-VolumeCache -DriveLetter $env:DRIVE -ErrorAction SilentlyContinue
+            Write-Host "已拷到 $dst —— PC 上先安全弹出，再在板子上 msc stop / mount onboard0 / elm" -ForegroundColor Green
+        }
     }
 
     'watch' {

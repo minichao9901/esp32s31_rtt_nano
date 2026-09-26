@@ -32,7 +32,7 @@ MK   := $(PWSH) tools/make.ps1
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build rebuild clean size flash flash-nostub flash-ocd run monitor msh watch tail reset safe headers fetch doc
+.PHONY: help build rebuild clean size flash flash-nostub flash-ocd run monitor msh rtt wav watch tail reset safe headers fetch doc
 
 help:
 	@$(MK) help
@@ -68,8 +68,17 @@ monitor:
 	@$(MK) monitor -Port "$(PORT)" -Seconds $(SECONDS)
 
 # 敲 msh 命令： make msh MSH="psram_speed 256"
+# msh 命令（走 USB-CDC；开端口会复位芯片）
 msh:
 	@$(MK) msh -Port "$(PORT)" -Msh "$(MSH)" -Seconds $(SECONDS)
+
+# rtt：SEGGER RTT 控制台（走 JTAG，**不碰 USB-CDC**）——CDC 哑了/被占时用这条
+rtt:
+	@$(MK) rtt -Port "$(PORT)" -Msh "$(MSH)" -Seconds $(SECONDS)
+
+# wav：造测试 WAV（DRIVE=D 顺手拷到 MSC 盘上；板子上先 msc start）
+wav:
+	@$(MK) wav
 
 # 不复位地观察串口（板子在跑、不想打断它）
 watch:
