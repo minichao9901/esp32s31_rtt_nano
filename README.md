@@ -6,6 +6,13 @@
 > 镜像由芯片 **bootROM 直接从 flash 0x2000 加载**（连 IDF 的二级 bootloader 都不要）。
 > 控制台走芯片内置 **USB-Serial/JTAG**（就是你一直用的 COM43），tick 用 **SYSTIMER**，中断走 **CLIC**。
 > 外设走 **RT-Thread 设备框架**：`PIN` / `SPI`（含 `QSPI`）/ `I2C` 三类标准 ops，msh 里可直接验证。
+>
+> **现在这块板子在这套移植上能干的活**（逐条都有真板实测，见 §2 与各小节）：
+> **16MB PSRAM**（读写 106~122 MB/s，§5.10）、**外接 SPI flash**（官方 SFUD + 块设备 `spi_flash0`，§5.11）、
+> **板载 16MB flash 划出 8MB 当 FAT 盘**（官方 DFS + elmfat：`mkfs` / `mount onboard0 /` / `ls` / `cat`，§5.12）、
+> 同一块盘**插到 PC 上就是 U 盘**（USB-HS Type-A 口 + 官方 CherryUSB MSC，§5.13）、
+> **LEDC PWM 放音**（官方 audio 框架：`tone` / `wav_play`，§5.14）、
+> **SEGGER RTT 控制台**（USB-CDC 哑了也能看日志、还能敲命令，§5.15）。
 
 ![ESP32-S31-Function-CoreBoard-1 正面](doc/img/board-front.png)
 
@@ -36,6 +43,10 @@ make monitor SECONDS=8                # 只看串口
 make size                             # 段大小 + CLIC 入口对齐检查
 make rebuild / clean                  # 全量重编 / 删 build\
 make safe                             # **救砖档**：CPU 回 40MHz（完全不动时钟树）
+make rtt MSH="ls" SECONDS=6           # SEGGER RTT 控制台（走 JTAG，**不碰 USB-CDC**）：CDC 哑了/被占时用
+make wav                              # 造测试 WAV 到 build\（默认 16k/8bit 小星星）
+make wav WAV_ARGS="--rate 22050 --bits 16"   # 换参数；再加 DRIVE=D 顺手拷进 MSC 盘（板上先 msc start）
+make flash-nostub                     # 退回 esptool --no-stub 烧录（只在"带 stub 烧不进去"时才用）
 make watch / tail / reset             # 不复位观察 / 容错观察（看复位循环）/ 手动拉 EN 复位
 make headers / doc                    # 维护类：重冻结 IDF 头 / 渲染文档 PDF
 ```
@@ -48,12 +59,18 @@ make headers / doc                    # 维护类：重冻结 IDF 头 / 渲染�
 | **RT-Thread 源码** | 编译 | `make fetch` 一条命令（稀疏检出，版本钉在 `rt-thread.pin`）|
 | **python + esptool** | 烧录 | `pip install esptool`；或直接用 IDF 的 python 环境 |
 | **PowerShell** | make 背后干活的脚本 | Windows 自带 5.1，或 pwsh 7 |
-| ~~**ESP-IDF**~~ | —— | **编译/烧录都不需要**。IDF 那边只有 45 个头文件被用到，已经**冻结**在 `bsp/idf_headers/` 里；只有 `make headers`（重新冻结）才需要 IDF 源码树 |
+| ~~**ESP-IDF**~~ | —— | **编译/烧录都不需要**。IDF 那边只有 46 个头文件被用到，已经**冻结**在 `bsp/idf_headers/` 里；只有 `make headers`（重新冻结）才需要 IDF 源码树 |
 
-> ✅ **验证方式**：把仓库跟踪的文件（89 个）单独导出到一个空目录，`make fetch` + `make build`
-> 能编出**逐字节相同**的 `app.bin`（63792 B）—— 也就是"换台机器只要有工具链就能编"。
-> ⚠️ 这个测试当时抓出一个真 bug：`fetch_rtt.ps1` 的稀疏检出清单漏了 `components/drivers`，
-> 新 clone 编到 `rtdevice.h` 就断（本机因为早期手工补过目录，一直没暴露）。
+> ✅ **验证方式**：把仓库跟踪的文件（**113 个**）单独导出到一个空目录，`make fetch` + `make build`
+> 能编出**逐字节相同**的 `app.bin`（**343872 B**，text/data/bss = 343186/568/62424）
+> —— 也就是"换台机器只要有工具链就能编"。
+> ⚠️ 这类"作者本机永远复现不出来"的测试一共抓出 **3 个真 bug**，全都只在**别人的 clone** 里暴露：
+> ① `fetch_rtt.ps1` 的稀疏检出清单漏了 `components/drivers` → 新 clone 编到 `rtdevice.h` 就断；
+> ② 后来又漏了 `components/dfs` + `components/libc`（DFS/elmfat 要编 `dfs_v1` 那 8 个 .c，
+>    还要 `-I` 到 libc 的 POSIX 头）→ 一路编到 `dfs_v1` 才断。清单已补成 7 个目录；
+> ③ `build.ps1` / `make.ps1` 会"向上两级"找工作区的 `local.env.ps1` —— 独立仓库里工程根就是
+>    仓库根，再往上 `Split-Path` 返回空串，`Join-Path ''` 直接抛异常，**一行没编就退出**。
+>    （本机因为上面还压着工作区两级目录，一直没暴露。）
 
 不用 make 也行，等价命令：
 
@@ -119,7 +136,7 @@ pwsh -File tools\reset_probe.py COM43 5          # 板子不理人时手动拉 E
 
 ---
 
-## 2. 当前状态（真板实测，2026-09-23）
+## 2. 当前状态（真板实测；2026-09-23 首次汇总，2026-09-26 补齐 DFS / MSC / 音频 / RTT）
 
 | 项目 | 状态 |
 |---|---|
@@ -145,7 +162,7 @@ pwsh -File tools\reset_probe.py COM43 5          # 板子不理人时手动拉 E
 | **USB MSC** | ✅ 官方 CherryUSB（RT-Thread 自带）+ 本工程胶水：USB-HS 口枚举成 U 盘，PC 能格式化/拷文件、板子挂载后能读回（§5.13） |
 | **音频** | ✅ 官方 audio 框架 + `drv_audio_pwm.c`（LEDC PWM，GPIO20）：`tone`/`wav_play` 实测 16kHz 采样率精确、8/16 位 WAV 都能放（§5.14） |
 | **SEGGER RTT** | ✅ 官方源码 + `tools/rtt.py`（自己实现主机端，走 OpenOCD telnet）：**USB-CDC 哑了也能看日志、还能敲命令**（§5.15） |
-| 镜像大小 | 约 50 KB（`.bin`，含 finsh + 三个外设驱动） |
+| 镜像大小 | **343872 B ≈ 336 KB**（`app.bin`；text/data/bss = 343186/568/62424，`make size` 可复核）—— 含 finsh + DFS/elmfat + CherryUSB MSC + audio + RTT |
 
 > ⚠️ **板上那颗 16MB flash 挂在 SPI0/1（专用脚），不在 GPSPI2 上**；`flash0` 指的是 J2 上
 > 外接的 SPI NOR 模块（默认接线 SCK=43 / MOSI=44 / MISO=45 / CS=46）。
@@ -218,37 +235,62 @@ pwsh -File tools\build_doc.ps1 -Name startup-linker-elf-annotated   # 只渲染�
 ```
 rtt_nano_s31/
 ├── bsp/
-│   ├── startup.S          上电入口：关看门狗 / 设栈 / 设 gp / mtvec=CLIC入口 / 清 bss / 进 entry()
-│   ├── trap_gcc.S         CLIC 64B 对齐跳板 + rt_hw_do_after_save_above
-│   ├── trap_handler.c     中断分发 + 异常现场打印（覆盖 libcpu 的弱符号）
-│   ├── board.c            堆初始化 + 时钟初始化 + 开机横幅 + **复位原因自报**
-│   ├── drv_clk.c          **320MHz**：CPLL 起振/标定 → 分频器 → root 时钟原子切换 + 实测频率 + 提频守卫
-│   ├── drv_systick.c      SYSTIMER 1ms tick + CLIC + `s31_systimer_get_ticks()`（全工程的时基）
-│   ├── drv_usj.c          USB-Serial/JTAG 底层（发送/接收环形缓冲 + pump）
-│   ├── drv_usj_dev.c      `usj` 字符设备（RX 中断 → rx_indicate → 设备框架）
-│   ├── drv_gpio.c         PIN 设备：rt_pin_ops（GPIO32~63 走第二组寄存器）
-│   ├── drv_i2c.c          I2C 主机：rt_i2c_bus_device_ops（i2c0/i2c1）
-│   ├── drv_spi.c          GPSPI2 主机：rt_spi_ops + QSPI ops（spi2/qspi2、flash0/qflash0）
-│   ├── s31_iomux_table.h  63 个焊盘 → IO_MUX 偏移（tools\gen_iomux_table.ps1 生成）
-│   ├── rtconfig.h         Nano 风格配置 + 设备框架开关
-│   ├── linker.ld          内存布局 + 三张"必须 KEEP"的表 + `.noinit` 跨复位保留区
-│   ├── s31_regs.h         用到的寄存器地址（每个都标了 IDF 出处）
-│   └── syscalls_stub.c    newlib 系统调用桩
-├── app/main.c           main 线程 + 全部 msh 命令
-├── rt-thread/           上游源码（tools\fetch_rtt.ps1 拉取，**不进 git**）
-├── prebuilt/            IDF bootloader.bin + partition-table.bin（留着恢复用，见 §8）
-├── doc/                移植教程 + 启动/链接/S ELF 对照（各一份 .md 与生成的 PDF）
+│   ├── startup.S           上电入口：关看门狗 / 设栈 / 设 gp / mtvec=CLIC入口 / 清 bss / 进 entry()
+│   ├── trap_gcc.S          CLIC 64B 对齐跳板 + rt_hw_do_after_save_above
+│   ├── trap_handler.c      中断分发 + 异常现场打印（覆盖 libcpu 的弱符号）
+│   ├── board.c             堆初始化 + 时钟初始化 + 开机横幅 + **复位原因自报**
+│   ├── drv_clk.c           **320MHz**：CPLL 起振/标定 → 分频器 → root 时钟原子切换 + 实测频率 + 提频守卫
+│   ├── drv_systick.c       SYSTIMER 1ms tick + CLIC + `s31_systimer_get_ticks()`（全工程的时基）
+│   ├── drv_usj.c           USB-Serial/JTAG 底层（发送/接收环形缓冲 + pump）
+│   ├── drv_usj_dev.c       `usj` 字符设备（RX 中断 → rx_indicate → 设备框架）
+│   ├── drv_gpio.c          PIN 设备：rt_pin_ops（GPIO32~63 走第二组寄存器）
+│   ├── drv_i2c.c           I2C 主机：rt_i2c_bus_device_ops（i2c0/i2c1）
+│   ├── drv_spi.c           GPSPI2 主机：rt_spi_ops + QSPI ops（spi2/qspi2、flash0/qflash0）
+│   ├── drv_spi_flash.c     外接 SPI flash：调官方 `rt_sfud_flash_probe()`（注册块设备 `spi_flash0`，§5.11）
+│   ├── drv_flash_onboard.c 板载 16MB flash 划 8MB 做磁盘：ROM `esp_rom_spiflash_*` + 4KB 读-改-擦-写（`onboard0`，§5.12）
+│   ├── drv_usb_msc.c       CherryUSB 的 S31 对接层 + MSC 盘：USB-HS 口枚举成 U 盘（`msc start|stop`，§5.13）
+│   ├── drv_audio_pwm.c     `sound0`：LEDC PWM 放音（GPIO20 + SYSTIMER 采样时钟，§5.14）
+│   ├── drv_rtt.c           SEGGER RTT 控制台：把控制台输出镜像进 RTT + 收命令送 msh（§5.15）
+│   ├── drv_lcd_axs15352.c  外接 SPI 屏 240×296（`lcd` 命令）
+│   ├── s31_psram.c / .h    PSRAM 初始化与访问接口（`psram_*` 命令）
+│   ├── s31_iomux_table.h   63 个焊盘 → IO_MUX 偏移（tools\gen_iomux_table.ps1 生成）
+│   ├── s31_regs.h          用到的寄存器地址（每个都标了 IDF 出处）
+│   ├── rtconfig.h          Nano 风格配置 + 设备框架 / DFS / audio / CherryUSB 开关
+│   ├── sdkconfig.h         极简版 sdkconfig 宏（给冻结的 idf_headers 用；**不是** IDF 生成的那份 84KB）
+│   ├── usb_config.h        CherryUSB 配置（HS / DWC2 / MSC 缓冲）
+│   ├── linker.ld           内存布局 + 三张"必须 KEEP"的表 + `.noinit` 跨复位保留区
+│   ├── idf_headers/        冻结的 46 个 IDF 头 + `_SOURCE.txt` 出处（`make headers` 重新冻结）
+│   ├── segger_rtt/         **SEGGER 官方 RTT 源码**（一字未改，只动官方留给用户的 Conf 头；许可见文末）
+│   └── syscalls_stub.c     newlib 系统调用桩
+├── app/
+│   ├── main.c              main 线程 + 除 wav 外的全部 msh 命令
+│   └── wav_player.c        `wav_play`：放 FAT 里的 WAV（16k/8bit、22k/16bit 都实测过，§5.14）
+├── rt-thread/              上游源码（`tools\fetch_rtt.ps1` 按 `rt-thread.pin` 拉取，**不进 git**）
+├── prebuilt/               IDF 的 bootloader.bin + partition-table.bin（留着恢复 IDF 启动，见 §8）
+├── doc/                    移植教程 + 启动/链接/S ELF 对照（各一份 .md 与生成的 PDF）、style.css、img\
 ├── tools/
-│   ├── fetch_rtt.ps1      稀疏检出 RT-Thread（v5.2.2，记 commit）
-│   ├── build.ps1          逐文件编译 → 链接 → elf2image → 烧 0x2000 → 抓日志（`-Safe` 救砖档）
+│   ├── make.ps1            Makefile 背后真正干活的（build/flash/msh/rtt/wav/… 全在这）
+│   ├── build.ps1           逐文件编译 → 链接 → elf2image → 烧 0x2000 → 抓日志（`-Safe` 救砖档）
+│   ├── fetch_rtt.ps1       按 `rt-thread.pin` 稀疏检出 RT-Thread（7 个目录，版本记进 `rt-thread.commit`）
 │   ├── gen_iomux_table.ps1 从 IDF 的 io_mux_reg.h 生成焊盘偏移表
-│   ├── build_doc.ps1      doc\*.md → PDF（pandoc + Edge headless）
-│   ├── msh.py             开串口 → 等启动 → 敲命令 → 收响应（存证据）
-│   ├── read_port.py       单纯读串口
-│   ├── usj_watch.py       **开端口不碰 DTR/RTS** 的观察器（区分"谁在复位板子"）
-│   ├── tail_port.py       容错观察：设备掉了自动重开，用来抓复位循环
-│   └── reset_probe.py     手动 DTR/RTS 复位探测（板子不理人时用）
-└── captures/            实测抓包（不进 git）
+│   ├── sync_idf_headers.ps1 重新冻结 `bsp\idf_headers\`（需要 IDF 源码树）
+│   ├── build_doc.ps1       doc\*.md → PDF（pandoc + Edge headless）
+│   ├── make_test_wav.py    造测试 WAV（`make wav`）
+│   ├── msh.py              开串口 → 等启动 → 敲命令 → 收响应（存证据）
+│   ├── read_port.py        单纯读串口
+│   ├── usj_watch.py        **开端口不碰 DTR/RTS** 的观察器（区分"谁在复位板子"）
+│   ├── tail_port.py        容错观察：设备掉了自动重开，用来抓复位循环
+│   ├── reset_probe.py      手动 DTR/RTS 复位探测（板子不理人时用）
+│   ├── s31_serial.py       开 USB-Serial/JTAG 并把芯片"复位到 app"（不碰调试器）
+│   ├── rtt.py              SEGGER RTT 主机端（自己实现，走 OpenOCD 的 telnet 读写内存）
+│   ├── ocd_keep.py         起一个常驻 OpenOCD（等 telnet 4444 就绪），供 rtt.py / gdb 复用
+│   ├── ocd_cmd.py          往 OpenOCD telnet 发一条命令并打印回复
+│   ├── ocd_flash.ps1       走 JTAG（OpenOCD）烧录 —— 不碰 USB-CDC
+│   └── ocd_audio_live2.gdb 放音过程中挂 gdb 看音频变量的脚本
+├── captures/               实测抓包（**不进 git**）
+├── Makefile                薄封装（真实逻辑在 tools\make.ps1）
+├── rt-thread.pin           钉住"本工程验证过"的 RT-Thread tag + commit
+└── LICENSE                 Apache-2.0
 ```
 
 ---
@@ -700,7 +742,8 @@ GND 用 J2 的 33/34/37/38。⚠️ GPIO 直推喇叭只有几 mA（声音很小
 
 抓法（两边同时跑）：RTT 会话里敲 `tone 440` / `wav_play ...`，**会话保持十几秒**，
 采集脚本在中间抓 —— `make rtt MSH="tone 440" SECONDS=16` 起在后台，
-`python tools\kingst_la.py capture --rate 20000000 --depth 2000000 --channels 0 --stats` 前台抓。
+`python tools\kingst_la.py capture --rate 20000000 --depth 2000000 --channels 0 --stats` 前台抓
+（⚠️ `kingst_la.py` 是**作者工作区**里的工具，**不在本仓库** —— 这里只留抓法与判据，换别的逻辑分析仪软件同理）。
 
 ### 🚨 2026-09-26 第二轮：WAV 全程静音的真凶 + 时钟/中断三个坑
 
@@ -1178,8 +1221,10 @@ msh >
 |---|---|
 | 本工程代码（`bsp/`、`app/`、`tools/`、启动汇编、链接脚本…） | Apache-2.0，见 [LICENSE](LICENSE) |
 | `rt-thread/`（**不进库**，由 `tools/fetch_rtt.ps1` 按 `rt-thread.pin` 拉取） | [RT-Thread](https://github.com/RT-Thread/rt-thread)，Apache-2.0 |
-| `bsp/idf_headers/`（冻结的 45 个 IDF 头） | [ESP-IDF](https://github.com/espressif/esp-idf)，Apache-2.0，**原样复制未修改**，每个文件保留自己的版权头；出处见该目录的 `_SOURCE.txt` 与 `README.md` |
+| `bsp/idf_headers/`（冻结的 46 个 IDF 头） | [ESP-IDF](https://github.com/espressif/esp-idf)，Apache-2.0，**原样复制未修改**，每个文件保留自己的版权头；出处见该目录的 `_SOURCE.txt` 与 `README.md` |
 | `prebuilt/`（IDF 的 bootloader.bin + partition-table.bin） | 由 ESP-IDF 构建产出，Apache-2.0；只为"一键恢复 IDF 启动"用 |
+| **`bsp/segger_rtt/`（SEGGER RTT 官方源码，真的进库了）** | [SEGGER RTT](https://www.segger.com/) 官方实现，**SEGGER 自己的许可**（允许在任意产品中免费使用，要求保留版权头）—— **不是 Apache-2.0**；除官方预留的 `SEGGER_RTT_Conf.h` 外一字未改 |
+| `rt-thread/` 树里用到的其它第三方组件（SFUD / elmfat(FatFs) / CherryUSB / dev_audio） | 随 RT-Thread 源码树分发，各自许可（见树内各文件头）；**都不进本仓库**，由 `make fetch` 拉取 |
 
-> 本工程**不包含**任何 RT-Thread 或 ESP-IDF 的源码副本（那 45 个头是**接口定义**，
+> 本工程**不包含**任何 RT-Thread 或 ESP-IDF 的源码副本（那 46 个头是**接口定义**，
 > 冻结进库是为了让"不装 IDF 也能编译"成立）。
