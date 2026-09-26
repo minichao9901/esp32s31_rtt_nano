@@ -112,7 +112,7 @@ pwsh -File tools\reset_probe.py COM43 5          # 板子不理人时手动拉 E
 | `onboard [-t]` | 板载 flash 磁盘：容量/偏移；`-t` 强制重跑"擦→写→读回"自检（见 §5.12） |
 | `mkfs <dev>` / `mount <dev> <path> <fs>` / `umount` / `ls` / `cat` / `df` / `mkdir` / `echo <s> <file>` / `rm` | **DFS + elmfat（官方组件）** 的文件操作 —— `mkfs onboard0` → `mount onboard0 / elm`（见 §5.12） |
 | `msc start\|stop\|status` | 把 `onboard0` 变成 PC 上的 U 盘（USB-HS 口，CherryUSB 官方 MSC 类，见 §5.13） |
-| `sound [-m]` | PWM 放音设备 `sound0` 状态；`-m` 量 1 秒实际采样率 + 占空比范围（见 §5.14） |
+| `sound [-m] [-g [ms]]` | PWM 放音设备 `sound0` 状态；`-m` 量 1 秒实际采样率 + 占空比范围；`-g` 软件 GPIO 1kHz 方波自检（见 §5.14） |
 | `tone <hz> [ms]` | 放一段正弦（不依赖文件系统；省略 ms = 后台一直响，`tone 0` 停） |
 | `wav_play [-i] [-v n] [-l 秒] <文件>` | 放 FAT 里的 WAV（`-i` 只看文件头，见 §5.14） |
 | `rtt` | SEGGER RTT 控制台状态（控制块地址、缓冲水位，见 §5.15） |
@@ -645,6 +645,7 @@ msh /> mount onboard0 / elm
 msh /> wav_play -i /STAR8.WAV  # 只看文件头
 msh /> wav_play /STAR8.WAV     # 放（8/16 位、单/双声道、8k~48kHz PCM 都行）
 msh /> wav_play -v 2 /STAR8.WAV  # 音量减半（右移 2 位）
+msh /> sound -g 5000           # 软件 GPIO 1kHz 方波自检（分"芯片没输出"还是"探头没夹好"）
 ```
 
 **接线**：`GPIO20`（J2-26）→ RC 低通（1kΩ + 100nF，截止 ~1.6kHz）→ 小喇叭；
@@ -669,6 +670,37 @@ GND 用 J2 的 33/34/37/38。⚠️ GPIO 直推喇叭只有几 mA（声音很小
 —— 都是**实时**（8bit/16kHz = 15.6kB/s、16bit = 31.2kB/s）。
 
 ⚠️ 44.1kHz 只能按 363 拍取整（实际 44077Hz，-0.05%，听不出来，但别拿它做测速基准）。
+
+### 🚨 两条只有"上逻辑分析仪"才抓得到的坑（2026-09-26）
+
+现象：`tone` 跑得好好的（`sound -m` 报 ISR **16000/秒**、占空比采样 29..228 一直在动），
+**但 GPIO20 上是一条直线**（KingstVIS 抓 100ms：无跳变）。而且寄存器**读回来全对**
+（`timer0_conf=0x00002008`、`chn0_conf0=0x04`、`duty=0x800`、`OUT_SEL=126`、IO_MUX MCU_SEL=1）。
+两条根因，都在 S31 的 LEDC 自己身上：
+
+| # | 坑 | 缺了它的现象 / 修法 |
+|---|---|---|
+| ① | **timer / channel 有独立上电位**：`LEDC0.timer_power_up_conf.timer0_power_up`、`LEDC0.ch_power_up_conf.ch0_power_up`，复位默认**都是 0 = 断电**。时钟门控全开了也没用，定时器根本不计数 | 初始化时 `|= (1<<timer)` / `|= (1<<ch)`（官方 `ledc_ll_enable_timer_power` / `ledc_ll_enable_channel_power`，IDF 在 `ledc_timer_config()` / `ledc_channel_config()` 里各开一次）|
+| ② | **占空比有影子寄存器**：只写 `duty_init.duty` **不生效**，要"锁存 + 通道参数更新"才落地 = `conf0.sig_out_en=1` → `conf1.duty_start=1` → `conf0.para_up=1`（官方 `_ledc_update_duty()` 那三步）；`duty_start` 是自清位、`para_up` 是 WT 位，所以每个样本写一次都是对的 | 现象：定时器在数、寄存器读回对，但输出**恒定**（LA 直线）。修法：`s31_audio_set_duty()` 写三条 |
+
+→ 教训：**S31 的 LEDC 别按"老 ESP32 的寄存器印象"配**，先照着
+`components/esp_hal_ledc/esp32s31/include/hal/ledc_ll.h` 抄一遍（每个动作写哪一位它都写明了）。
+
+**怎么分清"芯片没输出"和"探头没夹好"**：`sound -g [ms]`（默认 3s）把音频脚从 LEDC 信号上
+摘下来、接到**软件 GPIO_OUT**，用 SYSTIMER 定一个 1kHz 方波 —— 与 LEDC 一点关系都没有。
+实测（LA 抓 100ms）：**200 个跳变 / 100 个上升沿 / 高低各 500µs** ✓
+（这一步过了就说明焊盘、输出使能、探针、接线全是好的 → 问题一定在 LEDC 那边，别再去查接线）。
+
+**LA 实测波形**（GPIO20，KingstVIS MIPI16 @20MS/s，100ms 窗口）：
+
+| 场景 | 实测 |
+|---|---|
+| `tone 440` 一直响 | **15625 个上升沿/100ms = 156.25kHz** 载波 ✓（正好 = XTAL 40MHz ÷ 2⁸）；占空比在 **11%↔99%** 之间摆，每个 **2.27ms**（= 440Hz 一个周期）的窗口都扫满一整轮 ✓ |
+| `wav_play -l 8 /STAR8.WAV`（用 MSC 写进板载 flash 的那个） | 同样 156.25kHz 载波 + 随音乐变化的占空比（抓到那段均值 54%、峰谷 43%↔55%）✓ |
+
+抓法（两边同时跑）：RTT 会话里敲 `tone 440` / `wav_play ...`，**会话保持十几秒**，
+采集脚本在中间抓 —— `make rtt MSH="tone 440" SECONDS=16` 起在后台，
+`python tools\kingst_la.py capture --rate 20000000 --depth 2000000 --channels 0 --stats` 前台抓。
 
 ---
 

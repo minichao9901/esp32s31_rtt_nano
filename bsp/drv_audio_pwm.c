@@ -66,6 +66,9 @@
 #define S31_GPIO_FUNC_OUT_SEL(n) (S31_GPIO_BASE_ + 0xAF4u + 4u * (n))
 #define S31_GPIO_ENABLE_W1TS_   (S31_GPIO_BASE_ + 0x38u)
 #define S31_GPIO_ENABLE1_W1TS_  (S31_GPIO_BASE_ + 0x44u)
+#define S31_GPIO_OUT_W1TS_      (S31_GPIO_BASE_ + 0x08u)   /* 软件 GPIO 输出置位/清位 */
+#define S31_GPIO_OUT_W1TC_      (S31_GPIO_BASE_ + 0x0Cu)
+#define S31_SIG_GPIO_OUT        256u    /* SIG_GPIO_OUT_IDX：OUT_SEL=256 → 走软件 GPIO_OUT */
 #define S31_IOMUX_MCU_SEL_S     12
 #define S31_IOMUX_FUN_IE        (1u << 9)
 #define S31_IOMUX_FUN_PU        (1u << 8)
@@ -124,19 +127,35 @@ static struct s31_pwm_audio s_audio;
  *===========================================================================*/
 static void s31_audio_ledc_init(void)
 {
+    rt_uint32_t v;
+
     /* 1) 时钟：APB 门控 + 复位脉冲 + 放开复位 + 时钟源 + 时钟使能
      *    （hp_sys_clkrst_reg.h:3275 的 ledc_ctrl0）*/
     S31_REG32(S31_HP_SYS_CLKRST_LEDC_CTRL0) |= S31_LEDC_CLK_APB_EN;
     S31_REG32(S31_HP_SYS_CLKRST_LEDC_CTRL0) |= S31_LEDC_CLK_RST_EN;
     S31_REG32(S31_HP_SYS_CLKRST_LEDC_CTRL0) &= ~S31_LEDC_CLK_RST_EN;
     S31_REG32(S31_HP_SYS_CLKRST_LEDC_CTRL0) |= S31_LEDC_CLK_FORCE_NORST;
-    /* 时钟源选择保持复位默认（0）；具体是哪个源由实测载波频率反推 —— 见 sound 命令 */
+    /* 时钟源**显式**选 XTAL(40MHz)：LEDC0_CLK_SRC_SEL 0=XTAL / 1=RC_FAST / 2=PLL_DIV
+     * （编码出处 hal/esp32s31/ledc_ll.h 的 ledc_ll_set_slow_clk_sel；复位默认就是 0）*/
+    v  = S31_REG32(S31_HP_SYS_CLKRST_LEDC_CTRL0);
+    v &= ~S31_LEDC_CLK_SRC_SEL_M;
+    v |=  (0u << S31_LEDC_CLK_SRC_SEL_S);
+    S31_REG32(S31_HP_SYS_CLKRST_LEDC_CTRL0) = v;
     S31_REG32(S31_HP_SYS_CLKRST_LEDC_CTRL0) |= S31_LEDC_CLK_EN;
 
     /* 2) 强制打开寄存器时钟（空闲时也能写寄存器）*/
     LEDC0.conf.clk_en = 1;
 
-    /* 3) 定时器：duty_res=8（256 级）、clk_div=1.0（低 8 位是小数部分）、先复位
+    /* 3) 🚨 逐 timer / 逐通道**上电**（S31 的 LEDC 独有的两组位，复位默认是"断电"）
+     *    真凶记录（2026-09-26）：少了这两条，寄存器**全都读回正确值**（div/duty_res/
+     *    sig_out_en/计时器都没复位）、采样 ISR 也照跑（那是 SYSTIMER 的账），
+     *    但定时器根本不计数、通道不输出 → **引脚是一条直线**（逻辑分析仪抓到的实况）。
+     *    出处：hal/esp32s31/ledc_ll.h 的 ledc_ll_enable_timer_power / _channel_power，
+     *    IDF 驱动在 ledc_timer_config()/ledc_channel_config() 里各开一次。*/
+    LEDC0.timer_power_up_conf.val |= (1u << S31_AUDIO_LEDC_TIMER);
+    LEDC0.ch_power_up_conf.val    |= (1u << S31_AUDIO_LEDC_CH);
+
+    /* 4) 定时器：duty_res=8（256 级）、clk_div=1.0（低 8 位是小数部分）、先复位
      *    → para_up 让配置生效 → 放开复位 */
     ledc_timern_conf_reg_t tc = { 0 };
     tc.duty_res = S31_AUDIO_DUTY_RES;
@@ -147,7 +166,7 @@ static void s31_audio_ledc_init(void)
     tc.para_up = 1;                     /* 同步 clk_div/duty_res 到定时器时钟域 */
     LEDC0.timer_group[0].timer[S31_AUDIO_LEDC_TIMER].conf.val = tc.val;
 
-    /* 4) 通道：选 timer0、空闲电平低、使能输出；占空比先给 0（静音）*/
+    /* 5) 通道：选 timer0、空闲电平低、使能输出；占空比先给中点（静音）*/
     LEDC0.channel_group[0].channel[S31_AUDIO_LEDC_CH].conf0.timer_sel = S31_AUDIO_LEDC_TIMER;
     LEDC0.channel_group[0].channel[S31_AUDIO_LEDC_CH].conf0.idle_lv   = 0;
     LEDC0.channel_group[0].channel[S31_AUDIO_LEDC_CH].conf0.sig_out_en = 1;
@@ -155,11 +174,20 @@ static void s31_audio_ledc_init(void)
     s31_audio_set_duty(128);            /* 中点 = "无信号"（约 VCC/2，RC 后是 0 电平）*/
 }
 
-/* 占空比写入（ISR 里也调 → 必须够快：一条寄存器写）
- * duty 字段是 25 位、**低 4 位是小数**（IDF ledc_ll_set_duty 就是 `duty << 4`）。*/
+/* 占空比写入（ISR 里也调 → 必须够快：三条寄存器写）
+ * duty 字段是 25 位、**低 4 位是小数**（IDF ledc_ll_set_duty_int_part 就是 `duty << 4`）。
+ *
+ * 🚨 光写 duty_init **不生效**（2026-09-26 逻辑分析仪抓出来的第二条坑）：
+ *    S31 的通道有影子寄存器，占空比要"锁存 + 通道参数更新"才落地 ——
+ *    官方 `_ledc_update_duty()` 就是  sig_out_en=1 → duty_start=1 → conf0.para_up=1
+ *    （= ledc_hal_set_sig_out_en + ledc_hal_set_duty_start + ledc_hal_ls_channel_update）。
+ *    只写 duty 的现象：读回值全对、定时器也在数，但**输出恒定**（LA 是一条直线）。
+ *    duty_start 是自清位（R/W/SC）、para_up 是 WT 位，所以每次写 1 都对。*/
 static inline void s31_audio_set_duty(rt_uint32_t duty)
 {
-    LEDC0.channel_group[0].channel[S31_AUDIO_LEDC_CH].duty_init.duty = duty << 4;
+    LEDC0.channel_group[0].channel[S31_AUDIO_LEDC_CH].duty_init.duty  = duty << 4;
+    LEDC0.channel_group[0].channel[S31_AUDIO_LEDC_CH].conf1.duty_start = 1;
+    LEDC0.channel_group[0].channel[S31_AUDIO_LEDC_CH].conf0.para_up    = 1;
 }
 
 /*===========================================================================
@@ -409,10 +437,75 @@ static struct rt_audio_ops s31_audio_ops =
 };
 
 /*===========================================================================
+ * sound -g：软件 GPIO 方波自检（把 LEDC 摘出去，单独验"焊盘 → 探头"这条路）
+ *---------------------------------------------------------------------------
+ * 为什么要有它：LEDC 链路出故障时现象是"寄存器全对、引脚不动"（见上电位那条坑），
+ * 光看固件分不清"芯片真没输出"还是"探头没夹好/夹错脚"。
+ * 这条把音频脚从 LEDC 信号上摘下来接到**软件 GPIO_OUT**，用 SYSTIMER 定一个
+ * ~1 kHz 方波（示波器/LA 一眼可辨），跑完再把路由还回 LEDC。
+ *===========================================================================*/
+#define S31_GPIO_TEST_HZ   1000u
+
+static void s31_audio_gpio_selftest(rt_uint32_t ms)
+{
+    const int pad = S31_AUDIO_PWM_GPIO;
+    rt_uint32_t half = S31_SYSTIMER_HZ / (2u * S31_GPIO_TEST_HZ);   /* 半周期（tick）*/
+    rt_uint32_t edges = 0;
+    rt_uint64_t t0, end, next, now;
+    int lv = 0;
+
+    if (s_audio.running) {
+        rt_kprintf("[sound] 正在放音，先停下再自检（tone 0 / 等播放结束）\n");
+        return;
+    }
+
+    /* 摘掉 LEDC 信号，接上软件 GPIO_OUT；输出使能已经在 pin_mux 里开着 */
+    S31_REG32(S31_GPIO_FUNC_OUT_SEL(pad)) = S31_SIG_GPIO_OUT;
+    S31_REG32(S31_GPIO_ENABLE_W1TS_)      = 1u << pad;
+
+    rt_kprintf("[sound] 软件 GPIO 方波自检：GPIO%d，%u Hz，%u ms"
+               "（探头接这个脚，触发用上升沿）\n",
+               pad, (unsigned)S31_GPIO_TEST_HZ, (unsigned)ms);
+
+    t0   = s31_systimer_get_ticks();
+    end  = t0 + (rt_uint64_t)S31_SYSTIMER_HZ * ms / 1000u;
+    next = t0;
+    while (1) {
+        now = s31_systimer_get_ticks();
+        if (now >= end) {
+            break;
+        }
+        if (now >= next) {
+            next += half;
+            lv = !lv;
+            if (lv) {
+                S31_REG32(S31_GPIO_OUT_W1TS_) = 1u << pad;
+            } else {
+                S31_REG32(S31_GPIO_OUT_W1TC_) = 1u << pad;
+            }
+            edges++;
+        }
+    }
+    S31_REG32(S31_GPIO_OUT_W1TC_) = 1u << pad;      /* 收尾拉低 */
+
+    /* 路由还回 LEDC，并回到中点静音 */
+    S31_REG32(S31_GPIO_FUNC_OUT_SEL(pad)) = S31_LEDC_SIG_OUT_CH0;
+    s31_audio_set_duty(128);
+
+    rt_kprintf("[sound] 自检结束：翻了 %u 次（约 %u 个方波周期），路由已还回 LEDC\n",
+               (unsigned)edges, (unsigned)(edges / 2u));
+}
+
+/*===========================================================================
  * msh：sound / tone
  *===========================================================================*/
 static void sound(int argc, char **argv)
 {
+    if ((argc >= 2) && (rt_strcmp(argv[1], "-g") == 0)) {
+        s31_audio_gpio_selftest((argc >= 3) ? (rt_uint32_t)atoi(argv[2]) : 3000u);
+        return;
+    }
+
     if ((argc >= 2) && (rt_strcmp(argv[1], "-m") == 0)) {
         /* 自检：量 1 秒里 ISR 到底跑了多少次（= 实际采样率），
          * 顺便扫一眼占空比寄存器有没有在动（能证明 ISR 真的在改它）。
@@ -462,9 +555,14 @@ static void sound(int argc, char **argv)
                (unsigned)LEDC0.timer_group[0].timer[S31_AUDIO_LEDC_TIMER].conf.val,
                (unsigned)LEDC0.channel_group[0].channel[S31_AUDIO_LEDC_CH].conf0.val,
                (unsigned)LEDC0.channel_group[0].channel[S31_AUDIO_LEDC_CH].duty_init.val);
+    rt_kprintf("  上电位   : timer_power_up=0x%08x ch_power_up=0x%08x"
+               "（S31 特有：必须非 0，否则定时器不计数、引脚不动）\n",
+               (unsigned)LEDC0.timer_power_up_conf.val,
+               (unsigned)LEDC0.ch_power_up_conf.val);
     rt_kprintf("  用法     : tone <hz> [ms]   放正弦（验证通路）\n");
     rt_kprintf("             wav_play <文件>  放 WAV（见 wav_play -h）\n");
     rt_kprintf("             sound -m         量 1 秒的实际采样率 + 占空比范围\n");
+    rt_kprintf("             sound -g [ms]    软件 GPIO 方波自检（验引脚/探头，默认 3s）\n");
 }
 MSH_CMD_EXPORT(sound, show PWM audio device (sound0) status);
 
