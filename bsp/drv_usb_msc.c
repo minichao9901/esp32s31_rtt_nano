@@ -211,7 +211,15 @@ static void msc(int argc, char **argv)
         S31_CLRBITS(S31_CNNT_USB_OTG20_CTRL, S31_USB20_UTMIFS_CLK_EN | S31_USB20_PHYREF_CLK_EN);
         S31_SETBITS(S31_ALIVE_USB_OTGHS_CTRL,
                     S31_OTGHS_PHY_SUSPENDM_FORCE_EN | S31_OTGHS_PHY_PLL_FORCE_EN);
+        /* 把中断源**也**掐干净（2026-09-26 踩过）：只关 CLIC 的 IE、却让控制器继续
+         * assert 中断线的话，CLIC 里会留一个"pending 但被屏蔽"的中断源 ——
+         * 之后整个 CLIC 会卡死（音频 + tick 全停在 pending、MIE=1、mintthresh 全开
+         * 却再也不进中断）。所以：DWC2 关全局中断 + 清挂起 → 清 CLIC pending → 关 IE。*/
+        S31_REG32(S31_USB_OTGHS_BASE + S31_DWC2_GINTMSK) = 0;
+        S31_REG32(S31_USB_OTGHS_BASE + S31_DWC2_GINTSTS) = 0xFFFFFFFFu;
+        S31_REG8(S31_CLIC_IP(S31_USB_CLIC_ID)) = 0;
         S31_REG8(S31_CLIC_IE(S31_USB_CLIC_ID)) = 0;
+        __asm__ volatile ("csrc mie, %0" : : "r"(1u << S31_USB_CLIC_ID));
         s_msc_started = 0;
         rt_kprintf("[msc] 已停止（PHY 进 suspend、CLIC 中断已关）\n");
     } else {

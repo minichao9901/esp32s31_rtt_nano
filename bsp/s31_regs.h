@@ -189,6 +189,7 @@
 #define S31_DWC2_GHWCFG2            0x048u
 #define S31_DWC2_GUSBCFG            0x00cu
 #define S31_DWC2_GINTSTS            0x014u
+#define S31_DWC2_GINTMSK            0x018u      /* 全局中断屏蔽（stop 时写 0 掐掉中断源）*/
 #define S31_DWC2_DCTL               0x804u
 #define S31_DWC2_DSTS               0x808u
 

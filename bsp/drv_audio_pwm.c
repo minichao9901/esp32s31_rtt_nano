@@ -191,36 +191,85 @@ static inline void s31_audio_set_duty(rt_uint32_t duty)
 }
 
 /*===========================================================================
- * 采样时钟：SYSTIMER TARGET1（周期模式）
+ * 采样时钟：SYSTIMER TARGET1
+ *
+ * 🚨 这里**不用"周期模式"**（虽然 tick 用的就是它）：周期模式在"撤 arm → 再 arm"
+ *    一轮之后就不再自动重载了 —— 实测第二次播放时 target 永远停在第一次写入的
+ *    55377719，而计数器已经跑到 3.1e9，比较再也匹配不上：ISR 只跑 1 次、
+ *    写入线程在队列满后永久阻塞（现象 = "第一次响一下就停、第二次直接卡死"，
+ *    2026-09-26 用 gdb 读 SYSTIMER 寄存器定位）。
+ *    改成 **target 模式（一次性）+ ISR 里重装下一次目标**，就是 IDF `esp_timer`
+ *    在这颗 SYSTIMER 上的做法：写 HI → 写 LO → COMP1_LOAD 生效。
  *===========================================================================*/
+static volatile rt_uint32_t s_clk_period;      /* 采样周期（SYSTIMER tick）*/
+static volatile rt_uint64_t s_clk_target;      /* 下一次比较值 */
+
+/* 🚨 为什么"补乒乓缓冲"不在 ISR 里做（2026-09-26 定论）：
+ *    `rt_audio_tx_complete()` 会一路用到框架的内存池 / 数据队列 / 自旋锁，
+ *    在**中断上下文**里跑这些是雷（本 port 的 CLIC 在那种场景下卡死过：
+ *    音频和 tick 的中断全停在 pending、MIE=1、mintthresh=0x1f、mintstatus=0，
+ *    门全开着却再也不进来）。
+ *    → ISR 只做"写占空比 + 排下一次比较 + 放一个信号量"，
+ *      真正的补块交给一个普通线程（每 64ms 才一次，上下文安全）。*/
+static struct rt_semaphore s_refill_sem;
+static struct rt_thread   s_refill_thread;
+rt_align(RT_ALIGN_SIZE) static rt_uint8_t s_refill_stack[1024];
+static volatile rt_uint32_t s_refill_pending;
+
+static void s31_audio_refill_thread(void *param)
+{
+    (void)param;
+    while (1) {
+        if (rt_sem_take(&s_refill_sem, RT_WAITING_FOREVER) != RT_EOK) {
+            continue;
+        }
+        while (s_refill_pending != 0u) {
+            s_refill_pending--;
+            rt_audio_tx_complete(&s_audio.parent);
+        }
+    }
+}
+
+/* 🚨 装填目标值必须"**先撤 arm → 写目标 → COMP1_LOAD → 再 arm**"这一整套
+ *    （2026-09-26 第二次播放在这里栽了两轮）：
+ *      · armed 状态下写 TARGET1_HI/LO + COMP1_LOAD **完全不生效** ——
+ *        现象是 ISR 只跑 1 次、target 永远停在第一次写的值（gdb 读寄存器实锤：
+ *        T1_LO=49442535 而 UNIT0 已经跑到 1.4e9），写入线程随后在队列满时永久阻塞
+ *        （= "响一下就没了 / 第二次直接卡死"）。
+ *      · 出处：IDF `systimer_hal.c:81-84 / 115-118` 就是这四步，
+ *        并且 `rom_patch_rev1.c` 给 rev1 芯片打的补丁也是它 —— 说明这是硬件要求，
+ *        不是"顺手这么写"。*/
+static inline void s31_audio_rearm(rt_uint64_t target)
+{
+    S31_REG32(S31_SYSTIMER_CONF)        &= ~S31_SYSTIMER_TARGET1_WORK_EN;  /* 撤 arm */
+    S31_REG32(S31_SYSTIMER_TARGET1_HI)   = (rt_uint32_t)(target >> 32);
+    S31_REG32(S31_SYSTIMER_TARGET1_LO)   = (rt_uint32_t)(target & 0xFFFFFFFFu);
+    S31_REG32(S31_SYSTIMER_COMP1_LOAD)   = 1;                              /* 同步到比较器 */
+    S31_REG32(S31_SYSTIMER_CONF)        |= S31_SYSTIMER_TARGET1_WORK_EN;   /* 再 arm */
+}
+
 void s31_audio_clock_start(rt_uint16_t fs)
 {
     rt_uint32_t period = (S31_SYSTIMER_HZ + fs / 2u) / fs;      /* 四舍五入 */
-    rt_uint64_t now, first;
+    rt_uint64_t first;
 
-    /* 🚨 周期模式下**初始目标值必须给"当前计数 + period"**（2026-09-26 踩过）：
-     *    周期模式只是在"上一次目标值"上累加 period，而比较是**精确匹配**——
-     *    写 0 的话，第一个周期(0+period=1000)早就被计数器的当前值（几亿）甩在身后，
-     *    于是**只中断一次就再也不来了**（现象：ISR 计数=1、占空比冻结、
-     *    而 tone 的写入线程因为队列没人消费而永远阻塞）。
-     *    为什么第一次还会来一下：比较器发现目标"已过期"会补一次。*/
-    now   = s31_systimer_get_ticks();
-    first = now + period;
+    if (period == 0u) {
+        period = 1u;
+    }
+    first = s31_systimer_get_ticks() + period;
 
-    /* 先停：把目标先撤下来再改参数（避免改到一半就触发）*/
-    S31_REG32(S31_SYSTIMER_CONF) &= ~S31_SYSTIMER_TARGET1_WORK_EN;
+    /* 先关中断，参数就位后再开 */
     S31_REG32(S31_SYSTIMER_INT_ENA) &= ~S31_SYSTIMER_T1_INT;
+    S31_REG32(S31_SYSTIMER_CONF)    &= ~S31_SYSTIMER_TARGET1_WORK_EN;
 
-    S31_REG32(S31_SYSTIMER_TARGET1_HI)   = (rt_uint32_t)(first >> 32);
-    S31_REG32(S31_SYSTIMER_TARGET1_LO)   = (rt_uint32_t)(first & 0xFFFFFFFFu);
-    S31_REG32(S31_SYSTIMER_TARGET1_CONF) = (period & 0x03FFFFFFu) |
-                                           S31_SYSTIMER_TARGET0_PERIOD_MODE |   /* bit30：周期模式 */
-                                           0u;                                  /* bit31=0 → UNIT0 */
-    S31_REG32(S31_SYSTIMER_COMP1_LOAD)   = 1;      /* 让目标值生效 */
+    s_clk_period = period;
+    s_clk_target = first;
+
+    S31_REG32(S31_SYSTIMER_TARGET1_CONF) = 0u;  /* period_mode=0 → target 模式、UNIT0 */
+    s31_audio_rearm(first);
 
     S31_REG32(S31_SYSTIMER_INT_CLR) = S31_SYSTIMER_T1_INT;
     S31_REG32(S31_SYSTIMER_INT_ENA) |= S31_SYSTIMER_T1_INT;
-    S31_REG32(S31_SYSTIMER_CONF)    |= S31_SYSTIMER_TARGET1_WORK_EN;
 }
 
 void s31_audio_clock_stop(void)
@@ -243,6 +292,29 @@ static void s31_audio_isr(int irq, void *param)
     (void)param;
 
     S31_REG32(S31_SYSTIMER_INT_CLR) = S31_SYSTIMER_T1_INT;   /* 电平触发必须清 */
+
+    /* 一次性 target：立刻排下一次（必须在采样之前做；见 s31_audio_rearm 的注释：
+     * 必须撤 arm → 写目标 → COMP1_LOAD → 再 arm，否则写进去不生效）
+     *
+     * 🚨 **落后了就重新对齐，绝不去追**（2026-09-26 血的教训）：
+     *    音频时钟会被"别人关着中断干长活"拖后（典型：读文件系统时驱动关中断跑 ROM
+     *    读，一次几 ms）。若只做 `target += period`，落后量**永远补不回来** ——
+     *    比较值一直在过去 → 中断变成"一停就立刻再触发"的**风暴**：实测一次 6 秒的
+     *    wav_play 里 ISR 跑了 **1015169 次**（正常应 ≈96000），随后整个 CLIC 卡死：
+     *    音频和 tick 的中断都停在 pending（INT_RAW=0x3）、MIE=1、mintthresh=0x1f、
+     *    mintstatus=0、CLIC ie=1 —— 门全开着却再也不进来，系统只剩空闲线程在转。
+     *    → 迟到就 `now + period` 重锚（最多丢一个周期，听不出来）。*/
+    {
+        rt_uint64_t next = s_clk_target + s_clk_period;
+        rt_uint64_t now  = s31_systimer_get_ticks();
+
+        if ((rt_int64_t)(now - next) > 0) {
+            next = now + s_clk_period;
+        }
+        s_clk_target = next;
+        s31_audio_rearm(next);
+    }
+
     if (!s_audio.running) {
         return;
     }
@@ -276,11 +348,23 @@ static void s31_audio_isr(int irq, void *param)
      *    而缓冲只有 2048）——听感是杂音。这里统一定义：**p 是帧序号**。*/
     frame = ((rt_uint32_t)(s_audio.samplebits / 8u)) * s_audio.channels;
     p++;
-    if (p * frame >= S31_AUDIO_BLOCK_BYTES) {
-        rt_audio_tx_complete(&s_audio.parent);      /* 前半放完 → 让框架补前半 */
-        if (p * frame >= S31_AUDIO_TX_BYTES) {
-            p = 0;
-        }
+    /* 🚨 必须判"**刚好跨过**"（==），不能判 `>=`（2026-09-26 的"WAV 全程静音"真凶）：
+     *    p 每拍 +1，旧写法 `p*frame >= 1024` 在 p=1024..2047 **每一拍都成立** →
+     *    等于每个采样都通知框架"补一块"（16kHz 次，而不是 15.6 次/秒）→
+     *    队列被瞬间抽干、框架往缓冲里 memcpy 的几乎全是它自己 memset 的 0
+     *    → **引脚全程静音（LA 抓到 duty=0）**，而 `wav_play` 还照报"放完 N 字节"
+     *    （它只按音频时长睡，不看播放情况，所以骗了我们好几轮）。
+     *    `tone` 听着正常是因为它的 1 秒缓冲是**周期性**的，被抽干也照样读到有效样本
+     *    —— 典型的"被另一个测试掩盖的 bug"。*/
+    if (p * frame == S31_AUDIO_BLOCK_BYTES) {
+        /* 前半播完 → 让框架补这一块。**不在这里调框架**（见 s31_audio_refill_thread
+         * 的注释），只挂计数 + 放信号量，由补块线程去调。*/
+        s_refill_pending++;
+        rt_sem_release(&s_refill_sem);
+    } else if (p * frame == S31_AUDIO_TX_BYTES) {
+        s_refill_pending++;
+        rt_sem_release(&s_refill_sem);
+        p = 0;
     }
     s_audio.pos = p;
 }
@@ -306,6 +390,12 @@ static rt_err_t s31_audio_init(struct rt_audio_device *audio)
     s31_audio_ledc_init();
     s31_audio_irq_install();
 
+    /* 补缓冲线程（框架调用不进 ISR，见 s31_audio_refill_thread 的注释）*/
+    rt_sem_init(&s_refill_sem, "aud_rf", 0, RT_IPC_FLAG_PRIO);
+    rt_thread_init(&s_refill_thread, "audio_rf", s31_audio_refill_thread, RT_NULL,
+                   s_refill_stack, sizeof(s_refill_stack), 12, 10);
+    rt_thread_startup(&s_refill_thread);
+
     s_audio.samplerate = 16000;
     s_audio.channels   = 1;
     s_audio.samplebits = 8;
@@ -326,6 +416,16 @@ static rt_err_t s31_audio_start(struct rt_audio_device *audio, int stream)
     }
     s_audio.pos     = 0;
     s_audio.isr_cnt = 0;
+
+    /* 🚨 开时钟之前先把乒乓缓冲**预填满**：框架只在我方 ISR 调 rt_audio_tx_complete()
+     *    时才往缓冲里搬数据，而 ISR 的第一次调用发生在"播完前半块（64ms）"之后 ——
+     *    不预填的话，每次播放**最先播的两块（128ms）是缓冲里的残留**
+     *    （开机是 0 = 静音，二次播放是上一首的尾巴）。
+     *    两次调用正好把两块都填上（框架的 pos 走 0→1024→0），对齐后 ISR 每一步
+     *    要播的那块都已经就绪。*/
+    rt_audio_tx_complete(&s_audio.parent);
+    rt_audio_tx_complete(&s_audio.parent);
+
     s_audio.running = 1;
     s31_audio_clock_start(s_audio.samplerate);
     return RT_EOK;
@@ -497,10 +597,52 @@ static void s31_audio_gpio_selftest(rt_uint32_t ms)
 }
 
 /*===========================================================================
+ * sound -s：采样时钟自检（不走播放框架，把采样中断直接跑起来数数）
+ *---------------------------------------------------------------------------
+ * 为什么要有它："第二次播放卡死"的根因就在"时钟能不能反复起停"上。有了它，
+ * 一条命令就能验"再 arm 正不正常"，不用真放音频、也不用 JTAG 读寄存器。
+ *===========================================================================*/
+static void s31_audio_clock_selftest(rt_uint32_t ms)
+{
+    rt_uint32_t c0, c1, el, rate;
+    rt_tick_t t0;
+    rt_uint16_t fs = s_audio.samplerate ? s_audio.samplerate : 16000u;
+
+    if (s_audio.running) {
+        rt_kprintf("[sound] 正在放音，先停下再自检\n");
+        return;
+    }
+    s_audio.pos     = 0;
+    s_audio.isr_cnt = 0;
+    s_audio.running = 1;                    /* 让 ISR 正常出样本（框架没数据时喂 0）*/
+    s31_audio_clock_start(fs);
+
+    c0 = s_audio.isr_cnt;
+    t0 = rt_tick_get();
+    rt_thread_mdelay(ms);
+    c1 = s_audio.isr_cnt;
+    el = (rt_uint32_t)(rt_tick_get() - t0);
+
+    s_audio.running = 0;
+    s31_audio_clock_stop();
+    s31_audio_set_duty(128);                /* 回中点 = 静音 */
+
+    rate = el ? (rt_uint32_t)((rt_uint64_t)(c1 - c0) * RT_TICK_PER_SECOND / el) : 0u;
+    rt_kprintf("[sound] 采样时钟自检：%u tick 内 ISR %u 次 → %u Hz（期望 %u）%s\n",
+               (unsigned)el, (unsigned)(c1 - c0), (unsigned)rate, (unsigned)fs,
+               (rate + rate / 20u >= fs && rate <= fs + fs / 20u) ? " OK" : " **不对**");
+}
+
+/*===========================================================================
  * msh：sound / tone
  *===========================================================================*/
 static void sound(int argc, char **argv)
 {
+    if ((argc >= 2) && (rt_strcmp(argv[1], "-s") == 0)) {
+        s31_audio_clock_selftest((argc >= 3) ? (rt_uint32_t)atoi(argv[2]) : 1000u);
+        return;
+    }
+
     if ((argc >= 2) && (rt_strcmp(argv[1], "-g") == 0)) {
         s31_audio_gpio_selftest((argc >= 3) ? (rt_uint32_t)atoi(argv[2]) : 3000u);
         return;
@@ -562,6 +704,7 @@ static void sound(int argc, char **argv)
     rt_kprintf("  用法     : tone <hz> [ms]   放正弦（验证通路）\n");
     rt_kprintf("             wav_play <文件>  放 WAV（见 wav_play -h）\n");
     rt_kprintf("             sound -m         量 1 秒的实际采样率 + 占空比范围\n");
+    rt_kprintf("             sound -s [ms]    采样时钟自检（反复起停是否正常，默认 1s）\n");
     rt_kprintf("             sound -g [ms]    软件 GPIO 方波自检（验引脚/探头，默认 3s）\n");
 }
 MSH_CMD_EXPORT(sound, show PWM audio device (sound0) status);
@@ -597,9 +740,17 @@ static void s31_tone_build(void)
 static void s31_tone_fill(rt_uint32_t hz)
 {
     rt_uint32_t phase = 0;
-    rt_uint32_t inc = (hz * 256u) / TONE_FS;        /* 每采样相位增量（8.8 定点）*/
+    /* 🚨 相位是 8.8 定点、LUT 索引 = phase>>8（256 格 = 一个整周期），
+     *    所以每采样增量 = (hz/fs) × 256(格) × 256(定点) ——
+     *    第一版漏了后面那个 256（写成 hz*256/fs = 7）→ 每 36.6 个采样才走一格 LUT
+     *    → 实际生成的是 **1.7 Hz 的慢斜坡**（LA 上看就是"台阶乱跳"，
+     *    因为慢斜坡每采样的占空比只变几十 ns，正好卡在 20MS/s 的 50ns 量化上）。*/
+    rt_uint32_t inc = (hz * 65536u) / TONE_FS;
     rt_uint32_t i;
 
+    if (inc == 0u) {
+        inc = 1u;
+    }
     for (i = 0; i < TONE_BUF_BYTES; i++) {
         rt_int32_t v = s_sin8[(phase >> 8) & 0xFFu];
         s_tone_buf[i] = (rt_uint8_t)(128 + (v * 100) / 127);

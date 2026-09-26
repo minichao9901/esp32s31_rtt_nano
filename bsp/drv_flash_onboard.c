@@ -90,15 +90,19 @@ static int s31_ob_rom_read(rt_uint32_t addr, void *dst, rt_uint32_t len)
     if ((((rt_uint32_t)(rt_ubase_t)dst | len) & 3u) == 0u)
     {
         r = esp_rom_spiflash_read(addr, (uint32_t *)dst, (int32_t)len);
+        rt_hw_interrupt_enable(level);
     }
     else
     {
         /* 非对齐：按 4 字节粒度整段走中转。中转缓冲放**栈上**（不是 static），
-         * 否则两个线程同时走这条路会互相踩（关中断只挡中断，挡不住线程切换）。*/
+         * 否则两个线程同时走这条路会互相踩（关中断只挡中断，挡不住线程切换）。
+         * ⚠️ 关中断**只在每次 ROM 调用前后**，块与块之间放开来 ——
+         * 关一整段（几 ms）会把别人的采样时钟/网络/串口全拖住（踩过：音频 ISR 风暴）。*/
         rt_uint8_t tmp[72] __attribute__((aligned(8)));
         rt_uint8_t *out = (rt_uint8_t *)dst;
         rt_uint32_t done = 0u;
 
+        rt_hw_interrupt_enable(level);
         r = 0;
         while ((done < len) && (r == 0))
         {
@@ -112,7 +116,9 @@ static int s31_ob_rom_read(rt_uint32_t addr, void *dst, rt_uint32_t len)
                 n = (rt_uint32_t)sizeof(tmp) - 4u - head;
             }
             words = (head + n + 3u) & ~3u;
+            level = rt_hw_interrupt_disable();
             r = esp_rom_spiflash_read(base, (uint32_t *)tmp, (int32_t)words);
+            rt_hw_interrupt_enable(level);
             if (r == 0)
             {
                 rt_memcpy(out + done, tmp + head, n);
@@ -120,7 +126,6 @@ static int s31_ob_rom_read(rt_uint32_t addr, void *dst, rt_uint32_t len)
             done += n;
         }
     }
-    rt_hw_interrupt_enable(level);
     return r;
 }
 
@@ -418,6 +423,42 @@ static rt_err_t s31_ob_control(rt_device_t dev, int cmd, void *args)
 /*===========================================================================
  * msh 命令：onboard
  *===========================================================================*/
+/* 直读块设备的带宽（`onboard -b [KB]`，默认 256KB）：
+ * 为什么要有它：文件系统读慢时，得先分清是"块设备本身慢"还是"elmfat 慢"。
+ * 4KB 一块、绕开 DFS，只走 s31_ob_read → ROM 读。*/
+static void s31_ob_bench(rt_uint32_t kb)
+{
+    static rt_uint8_t buf[4096];
+    rt_uint32_t blks = (kb * 1024u) / 4096u;
+    rt_uint32_t i, blk = 0;
+    rt_tick_t t0;
+    rt_uint32_t ms, bps;
+
+    if (blks == 0u)
+    {
+        blks = 1u;
+    }
+    t0 = rt_tick_get();
+    for (i = 0; i < blks; i++)
+    {
+        if (rt_device_read(&s_ob_dev, (rt_off_t)(blk * 8u), buf, 8u) != 8u)
+        {
+            rt_kprintf("[onboard] 读失败 @块 %u\n", (unsigned)blk);
+            return;
+        }
+        blk++;
+        if (blk * 8u >= S31_OB_BLK_COUNT)
+        {
+            blk = 0u;
+        }
+    }
+    ms  = (rt_uint32_t)(rt_tick_get() - t0);
+    bps = ms ? (rt_uint32_t)((rt_uint64_t)blks * 4096u * 1000u / ms) : 0u;
+    rt_kprintf("[onboard] 直读 %u KB 用了 %u ms → %u kB/s（%u us/4KB 块）\n",
+               (unsigned)(blks * 4u), (unsigned)ms, (unsigned)(bps / 1024u),
+               (unsigned)(ms * 1000u / blks));
+}
+
 static void onboard(int argc, char **argv)
 {
     if ((argc >= 2) && ((rt_strcmp(argv[1], "-t") == 0) || (rt_strcmp(argv[1], "test") == 0)))
@@ -425,6 +466,11 @@ static void onboard(int argc, char **argv)
         rt_kprintf("[onboard] 强制自检（擦/写 0x%06x 那一个扇区）...\n",
                    (unsigned)S31_OB_SCRATCH_ADDR);
         s31_ob_selftest(RT_TRUE);
+        return;
+    }
+    if ((argc >= 2) && (rt_strcmp(argv[1], "-b") == 0))
+    {
+        s31_ob_bench((argc >= 3) ? (rt_uint32_t)atoi(argv[2]) : 256u);
         return;
     }
 
@@ -436,6 +482,7 @@ static void onboard(int argc, char **argv)
     rt_kprintf("  自检扇区   : 0x%06x（`onboard -t` 强制重跑一次擦/写/读自检）\n",
                (unsigned)S31_OB_SCRATCH_ADDR);
     rt_kprintf("  用法       : mkfs onboard0 -> mount onboard0 / elm -> ls / -> df\n");
+    rt_kprintf("               onboard -b [KB]   直读块设备测带宽（默认 256KB）\n");
     rt_kprintf("               ⚠️ 第一个文件系统要挂 \"/\"（DFS v1 没有虚拟根目录，见 README 坑 28）\n");
 }
 MSH_CMD_EXPORT(onboard, show/verify onboard flash disk (onboard [-t]));

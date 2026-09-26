@@ -202,11 +202,14 @@ static void wav_play(int argc, char **argv)
     rt_uint32_t left = data_bytes;
     rt_uint32_t limit = (max_sec > 0) ? ((rt_uint32_t)max_sec * h.byterate) : 0xFFFFFFFFu;
     rt_uint32_t played = 0;
+    rt_uint32_t bad_writes = 0;
     rt_tick_t  t0 = rt_tick_get();
+    rt_tick_t  t1;
 
     if (left > limit) {
         left = limit;
     }
+    t1 = rt_tick_get();
     while (left > 0u) {
         rt_size_t want = (left > sizeof(buf)) ? sizeof(buf) : left;
         int n = read(fd, buf, want);
@@ -218,17 +221,40 @@ static void wav_play(int argc, char **argv)
                 buf[k] = (rt_uint8_t)(128 + ((int)buf[k] - 128 >> vol_shift));
             }
         }
-        rt_device_write(snd, 0, buf, (rt_size_t)n);
+        {
+            rt_ssize_t w = rt_device_write(snd, 0, buf, (rt_size_t)n);
+
+            if (w != (rt_ssize_t)n) {
+                if (bad_writes == 0u) {
+                    rt_kprintf("[wav] ⚠️ sound0 只收下 %d/%d 字节（设备没在收数据！）\n",
+                               (int)w, (int)n);
+                }
+                bad_writes++;
+            }
+        }
         left -= (rt_uint32_t)n;
         played += (rt_uint32_t)n;
     }
 
     /* 🚨 别急着 close —— 框架的 replay 池能吞下十几 KB（这里 4x4KB），
      *    而 `rt_device_close()` 会把**还没播的**整块丢掉（_audio_flush_replay_frame）。
-     *    所以写入返回 ≠ 放完：要按"音频时长"等够再关（16kHz/8bit 就是 16kB/s）。*/
+     *    所以写入返回 ≠ 放完：要按"音频时长"等够再关（16kHz/8bit 就是 16kB/s）。
+     * 🚨 但"等够"会**掩盖供不上**：写入阶段比音频时长还慢 = 中间断断续续
+     *    （真踩过：提示"放完 6000ms"，其实只喂进去 12KB → 全程静音，
+     *     因为播放池一直空、框架往缓冲里填 0）。所以写入阶段的真实耗时也打出来。*/
     {
+        rt_uint32_t write_ms  = (rt_uint32_t)(rt_tick_get() - t1);
         rt_uint32_t expect_ms = (rt_uint32_t)((rt_uint64_t)played * 1000u /
                                               (h.byterate ? h.byterate : 1u));
+
+        rt_kprintf("[wav] 写入阶段 %u ms（%u kB/s），音频时长 %u ms%s\n",
+                   (unsigned)write_ms,
+                   (unsigned)(write_ms ? ((rt_uint64_t)played * 1000u / write_ms / 1024u) : 0u),
+                   (unsigned)expect_ms,
+                   (bad_writes != 0u) ? "  ⚠️ 有写入被拒（见上面的告警）" :
+                   (write_ms > expect_ms + expect_ms / 10u) ?
+                       "  ⚠️ 喂得比播得慢：中间会断续/静音" : "");
+
         while ((rt_uint32_t)(rt_tick_get() - t0) < expect_ms) {
             rt_thread_mdelay(10);
         }
